@@ -38,7 +38,7 @@ Telegram-микросервис для автоматической верифи
 Ringo распространяется по MIT; лицензия сохранена в `LICENSE.ringo`.
 
 Идея LLM-assisted gatekeeping и принцип «не пускать пользователя в группу до завершения проверки»
-сверялись с [Bouncer](https://github.com/k4yt3x/bouncer). Его код не копировался, так как проект AGPL-3.0.
+сверялись с [Bouncer](https://github.com/k4yt3x/bouncer).
 
 См. `THIRD_PARTY_NOTICES.md`.
 
