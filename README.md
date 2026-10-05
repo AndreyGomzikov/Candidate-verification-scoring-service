@@ -40,8 +40,6 @@ Ringo распространяется по MIT; лицензия сохране
 Идея LLM-assisted gatekeeping и принцип «не пускать пользователя в группу до завершения проверки»
 сверялись с проектом [Bouncer](https://github.com/k4yt3x/bouncer).
 
-См. `THIRD_PARTY_NOTICES.md`.
-
 ## Архитектура
 
 ```text
