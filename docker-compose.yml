@@ -1,8 +1,37 @@
+name: ai-gatekeeper
+
 services:
-  gatekeeper:
-    build: .
+  postgres:
+    image: postgres:16-alpine
     restart: unless-stopped
+    environment:
+      POSTGRES_USER: gatekeeper
+      POSTGRES_DB: gatekeeper
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - gatekeeper_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gatekeeper -d gatekeeper"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  gatekeeper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
     env_file:
       - .env
-    volumes:
-      - ./data:/app/data
+    environment:
+      # Password should be hexadecimal (without special URL characters).
+      # Compose overrides any old SQLite DATABASE_URL from env_file.
+      DATABASE_URL: postgresql+asyncpg://gatekeeper:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/gatekeeper
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  gatekeeper_pgdata:
