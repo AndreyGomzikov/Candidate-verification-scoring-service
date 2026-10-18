@@ -1,0 +1,125 @@
+name: AI Gatekeeper CI and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Python tests and Docker build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Python checks
+        run: |
+          python -m compileall -q app
+          python -m pytest -q
+
+      - name: Verify Docker image builds
+        run: docker build --tag ai-gatekeeper:ci .
+
+  deploy:
+    name: Deploy AI Gatekeeper to VPS
+    needs: ci
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || vars.ENABLE_AUTODEPLOY == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment: production
+    concurrency:
+      group: ai-gatekeeper-production
+      cancel-in-progress: false
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_PORT: ${{ secrets.VPS_PORT }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
+      VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate deployment settings and install SSH key
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${VPS_HOST:?Missing VPS_HOST}"
+          : "${VPS_PORT:?Missing VPS_PORT}"
+          : "${VPS_USER:?Missing VPS_USER}"
+          : "${VPS_DEPLOY_PATH:?Missing VPS_DEPLOY_PATH}"
+          : "${VPS_KNOWN_HOSTS:?Missing VPS_KNOWN_HOSTS}"
+          : "${VPS_SSH_KEY:?Missing VPS_SSH_KEY}"
+          test "$VPS_DEPLOY_PATH" = '/var/sftp/AI-Gatekeeper'
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          printf '%s\n' "$VPS_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          ssh-keygen -y -f "$HOME/.ssh/deploy_key" > /dev/null
+
+      - name: Pack tracked source only and upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=tar "$GITHUB_SHA" | gzip -c > release.tar.gz
+          scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes -i "$HOME/.ssh/deploy_key" \
+            -P "$VPS_PORT" release.tar.gz \
+            "$VPS_USER@$VPS_HOST:$VPS_DEPLOY_PATH/.release-$GITHUB_SHA.tar.gz"
+
+      - name: Deploy only this Compose project
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i "$HOME/.ssh/deploy_key" \
+            -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" \
+            bash -s -- "$VPS_DEPLOY_PATH" "$GITHUB_SHA" <<'REMOTE'
+          set -euo pipefail
+          DEPLOY_DIR="$1"
+          SHA="$2"
+          test "$DEPLOY_DIR" = '/var/sftp/AI-Gatekeeper'
+          test -s "$DEPLOY_DIR/.env" || { echo 'Server .env is missing or empty' >&2; exit 1; }
+          RELEASE="$DEPLOY_DIR/releases/$SHA"
+          umask 077
+          mkdir -p "$RELEASE"
+          tar -xzf "$DEPLOY_DIR/.release-$SHA.tar.gz" -C "$RELEASE"
+          ln -sfn "$DEPLOY_DIR/.env" "$RELEASE/.env"
+          cd "$RELEASE"
+          docker compose --env-file "$DEPLOY_DIR/.env" config --quiet
+          # Bootstrap PostgreSQL within the isolated ai-gatekeeper Compose project.
+          docker compose --env-file "$DEPLOY_DIR/.env" up -d postgres
+          docker compose --env-file "$DEPLOY_DIR/.env" exec -T postgres pg_isready -U gatekeeper -d gatekeeper
+          # Rebuild/recreate only the bot service; keep the database volume.
+          docker compose --env-file "$DEPLOY_DIR/.env" up -d --build --no-deps gatekeeper
+          sleep 8
+          BOT_ID="$(docker compose --env-file "$DEPLOY_DIR/.env" ps -q gatekeeper)"
+          test -n "$BOT_ID"
+          test "$(docker inspect --format '{{.State.Running}}' "$BOT_ID")" = true || {
+            echo 'Gatekeeper container is not running' >&2
+            exit 1
+          }
+          ln -sfn "$RELEASE" "$DEPLOY_DIR/current"
+          rm -f "$DEPLOY_DIR/.release-$SHA.tar.gz"
+          echo 'AI Gatekeeper container running; Telegram end-to-end test is still required.'
+          REMOTE
