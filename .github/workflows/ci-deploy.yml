@@ -43,7 +43,8 @@ jobs:
     needs: ci
     if: >-
       github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' || vars.ENABLE_AUTODEPLOY == 'true')
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && vars.ENABLE_AUTODEPLOY == 'true'))
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     environment: production
@@ -56,12 +57,12 @@ jobs:
       VPS_USER: ${{ secrets.VPS_USER }}
       VPS_DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
       VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
-      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      SSHPASS: ${{ secrets.VPS_PASSWORD }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate deployment settings and install SSH key
+      - name: Validate deployment settings and configure SSH
         shell: bash
         run: |
           set -euo pipefail
@@ -70,21 +71,31 @@ jobs:
           : "${VPS_USER:?Missing VPS_USER}"
           : "${VPS_DEPLOY_PATH:?Missing VPS_DEPLOY_PATH}"
           : "${VPS_KNOWN_HOSTS:?Missing VPS_KNOWN_HOSTS}"
-          : "${VPS_SSH_KEY:?Missing VPS_SSH_KEY}"
+          : "${SSHPASS:?Missing VPS_PASSWORD}"
           test "$VPS_DEPLOY_PATH" = '/var/sftp/AI-Gatekeeper'
+          test "$VPS_PORT" = '22'
           install -d -m 700 "$HOME/.ssh"
           printf '%s\n' "$VPS_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
-          printf '%s\n' "$VPS_SSH_KEY" > "$HOME/.ssh/deploy_key"
-          chmod 600 "$HOME/.ssh/deploy_key"
-          ssh-keygen -y -f "$HOME/.ssh/deploy_key" > /dev/null
+          ssh-keygen -F "$VPS_HOST" -f "$HOME/.ssh/known_hosts" >/dev/null || {
+            echo 'VPS_KNOWN_HOSTS does not contain the expected host key' >&2
+            exit 1
+          }
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends sshpass
 
       - name: Pack tracked source only and upload
         shell: bash
         run: |
           set -euo pipefail
           git archive --format=tar "$GITHUB_SHA" | gzip -c > release.tar.gz
-          scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes -i "$HOME/.ssh/deploy_key" \
+          sshpass -e scp -q \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PubkeyAuthentication=no \
+            -o PreferredAuthentications=password \
+            -o NumberOfPasswordPrompts=1 \
+            -o ConnectTimeout=15 \
             -P "$VPS_PORT" release.tar.gz \
             "$VPS_USER@$VPS_HOST:$VPS_DEPLOY_PATH/.release-$GITHUB_SHA.tar.gz"
 
@@ -92,25 +103,44 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i "$HOME/.ssh/deploy_key" \
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o PubkeyAuthentication=no \
+            -o PreferredAuthentications=password \
+            -o NumberOfPasswordPrompts=1 \
+            -o ConnectTimeout=15 \
             -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" \
             bash -s -- "$VPS_DEPLOY_PATH" "$GITHUB_SHA" <<'REMOTE'
           set -euo pipefail
           DEPLOY_DIR="$1"
           SHA="$2"
           test "$DEPLOY_DIR" = '/var/sftp/AI-Gatekeeper'
-          test -s "$DEPLOY_DIR/.env" || { echo 'Server .env is missing or empty' >&2; exit 1; }
+          test -s "$DEPLOY_DIR/.env" || {
+            echo 'Server .env is missing or empty' >&2
+            exit 1
+          }
+          if grep -Eq '^(TARGET_CHAT_ID=-1001234567890|ADMIN_CHAT_ID=-1009876543210)$' "$DEPLOY_DIR/.env"; then
+            echo 'Replace example Telegram chat IDs in server .env before deployment' >&2
+            exit 1
+          fi
           RELEASE="$DEPLOY_DIR/releases/$SHA"
           umask 077
           mkdir -p "$RELEASE"
           tar -xzf "$DEPLOY_DIR/.release-$SHA.tar.gz" -C "$RELEASE"
           ln -sfn "$DEPLOY_DIR/.env" "$RELEASE/.env"
           cd "$RELEASE"
+
+          # Do not display a rendered Compose configuration: it contains secrets.
           docker compose --env-file "$DEPLOY_DIR/.env" config --quiet
-          # Bootstrap PostgreSQL within the isolated ai-gatekeeper Compose project.
-          docker compose --env-file "$DEPLOY_DIR/.env" up -d postgres
-          docker compose --env-file "$DEPLOY_DIR/.env" exec -T postgres pg_isready -U gatekeeper -d gatekeeper
-          # Rebuild/recreate only the bot service; keep the database volume.
+
+          # Only the isolated ai-gatekeeper project is touched.
+          docker compose --env-file "$DEPLOY_DIR/.env" up -d --wait postgres
+          docker compose --env-file "$DEPLOY_DIR/.env" exec -T postgres \
+            sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "SELECT 1"' \
+            | grep -qx 1
+
+          # Replace the bot only; never delete the PostgreSQL volume.
           docker compose --env-file "$DEPLOY_DIR/.env" up -d --build --no-deps gatekeeper
           sleep 8
           BOT_ID="$(docker compose --env-file "$DEPLOY_DIR/.env" ps -q gatekeeper)"
@@ -119,6 +149,7 @@ jobs:
             echo 'Gatekeeper container is not running' >&2
             exit 1
           }
+
           ln -sfn "$RELEASE" "$DEPLOY_DIR/current"
           rm -f "$DEPLOY_DIR/.release-$SHA.tar.gz"
           echo 'AI Gatekeeper container running; Telegram end-to-end test is still required.'
