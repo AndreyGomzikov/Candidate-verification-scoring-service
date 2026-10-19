@@ -136,7 +136,7 @@ jobs:
 
           # Only the isolated ai-gatekeeper project is touched.
           docker compose --env-file "$DEPLOY_DIR/.env" up -d --wait postgres
-          docker compose --env-file "$DEPLOY_DIR/.env" exec -T postgres \
+          docker compose --env-file "$DEPLOY_DIR/.env" exec -T --interactive=false postgres \
             sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "SELECT 1"' \
             | grep -qx 1
 
