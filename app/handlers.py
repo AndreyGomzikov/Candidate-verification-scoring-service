@@ -409,12 +409,25 @@ class GatekeeperHandlers:
             return
         if not await self._is_allowed_admin(context, update.effective_user.id):
             return
+        # Translate status labels only for Telegram; database values stay unchanged.
+        status_labels = {
+            "interview": "Проходит анкетирование",
+            "scoring": "Проходит AI-проверку",
+            "pending_admin": "Ожидает решения администратора",
+            "approved": "Одобрено",
+            "rejected": "Отклонено администратором",
+            "auto_rejected": "Отклонено автоматически",
+            "expired": "Срок анкеты истёк",
+            "superseded": "Заменено новой заявкой",
+            "error": "Ошибка обработки",
+        }
         counts = await self.db.count_by_status()
         if not counts:
             text = "Заявок пока нет."
         else:
             text = "Статусы заявок:\n" + "\n".join(
-                f"• {key}: {value}" for key, value in sorted(counts.items())
+                f"• {status_labels.get(key, key)}: {value}"
+                for key, value in sorted(counts.items())
             )
         await update.effective_message.reply_text(text)
 
