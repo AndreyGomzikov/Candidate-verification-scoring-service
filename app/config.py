@@ -45,6 +45,8 @@ class Settings:
     interview_timeout_minutes: int = 30
     reapplication_cooldown_minutes: int = 60
     maintenance_interval_seconds: int = 60
+    support_rate_limit_count: int = 5
+    support_rate_limit_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -75,4 +77,6 @@ class Settings:
             maintenance_interval_seconds=max(
                 15, _int("MAINTENANCE_INTERVAL_SECONDS", 60)
             ),
+            support_rate_limit_count=max(1, _int("SUPPORT_RATE_LIMIT_COUNT", 5)),
+            support_rate_limit_seconds=max(1, _int("SUPPORT_RATE_LIMIT_SECONDS", 60)),
         )

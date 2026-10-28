@@ -232,3 +232,38 @@ def test_initial_dm_failure_is_not_automatic_decline():
     assert bot.decline_calls == 0
     assert db.last_status == CandidateStatus.PENDING_ADMIN
     assert bot.admin_messages
+
+
+def test_approval_notifies_candidate_with_exact_link():
+    item = candidate(status=CandidateStatus.PENDING_ADMIN.value, stage=4)
+    db = SimpleNamespace(
+        get_candidate=AsyncMock(return_value=item),
+        set_status=AsyncMock(return_value=item),
+    )
+    bot = SimpleNamespace(
+        approve_chat_join_request=AsyncMock(),
+        decline_chat_join_request=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+    handler = GatekeeperHandlers(settings=settings(), db=db, scorer=NoopScorer())
+    query = SimpleNamespace(
+        data="candidate:approve:1",
+        message=SimpleNamespace(chat=SimpleNamespace(id=-2002)),
+        answer=AsyncMock(),
+        edit_message_reply_markup=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=42, full_name="Admin"),
+    )
+
+    asyncio.run(handler.on_admin_decision(update, SimpleNamespace(bot=bot)))
+
+    bot.approve_chat_join_request.assert_awaited_once_with(
+        chat_id=item.target_chat_id, user_id=item.user_id
+    )
+    assert any(
+        call.args == (item.user_chat_id, texts.APPROVED)
+        for call in bot.send_message.await_args_list
+    )
+    db.set_status.assert_awaited_once()

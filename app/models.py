@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, DateTime, Integer, String, Text
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -61,4 +61,76 @@ class Candidate(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class SupportTicket(Base):
+    """One conversation until an administrator closes it."""
+
+    __tablename__ = "support_tickets"
+
+    __table_args__ = (
+        Index(
+            "uq_support_one_open_ticket_per_user", "user_id", unique=True,
+            postgresql_where=text("status = 'open'"),
+            sqlite_where=text("status = 'open'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"), index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    user_chat_id: Mapped[int] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_by_user_id: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class SupportMessage(Base):
+    """Persistent source + delivery information for each support message."""
+
+    __tablename__ = "support_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_private_chat_id", "source_private_message_id",
+            name="uq_support_candidate_source",
+        ),
+        Index(
+            "uq_support_delivery_alert_per_message", "related_message_id", unique=True,
+            postgresql_where=text("direction = 'delivery_alert'"),
+            sqlite_where=text("direction = 'delivery_alert'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("support_tickets.id"), index=True)
+    direction: Mapped[str] = mapped_column(String(24))
+    text: Mapped[str] = mapped_column(Text)
+    admin_user_id: Mapped[int | None] = mapped_column(BigInteger)
+    source_private_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    source_private_message_id: Mapped[int | None] = mapped_column(Integer)
+    source_admin_message_id: Mapped[int | None] = mapped_column(Integer, unique=True)
+    bot_admin_message_id: Mapped[int | None] = mapped_column(Integer, unique=True)
+    delivered_private_message_id: Mapped[int | None] = mapped_column(Integer)
+    delivery_error: Mapped[str | None] = mapped_column(String(80))
+    # A delivery_alert refers to the original failed message; NULL otherwise.
+    related_message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("support_messages.id"), nullable=True
+    )
+    # Persistent retry queue. A stale "sending" lease is reclaimed after a crash.
+    delivery_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    delivery_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

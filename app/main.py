@@ -47,6 +47,7 @@ def main() -> None:
         while True:
             try:
                 await handlers.expire_stale_interviews(application.bot)
+                await handlers.support.retry_due_messages(application.bot)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -88,6 +89,27 @@ def main() -> None:
     )
     application.add_handler(CommandHandler("start", handlers.on_start))
     application.add_handler(CommandHandler("status", handlers.on_status))
+    application.add_handler(CommandHandler("support_failed", handlers.support.on_failed_messages))
+    application.add_handler(CommandHandler("support_retry", handlers.support.on_retry_command))
+    application.add_handler(
+        CallbackQueryHandler(
+            handlers.support.on_close_ticket,
+            pattern=r"^support:close:\d+$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            handlers.support.on_retry_delivery,
+            pattern=r"^support:retry:\d+$",
+        )
+    )
+    # Privacy mode supports replies to messages originally sent by this bot.
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & filters.TEXT & filters.REPLY & ~filters.COMMAND,
+            handlers.support.on_admin_reply,
+        )
+    )
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,

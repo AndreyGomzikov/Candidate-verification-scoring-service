@@ -1,4 +1,5 @@
 from app.scoring import (
+    SYSTEM_PROMPT,
     ScoreResult,
     auto_reject_reason,
     calculate_confidence_score,
@@ -76,3 +77,22 @@ def test_parse_score_json():
     )
     assert result.location_score == 90
     assert result.confidence_score > 0
+
+
+def test_georgia_location_prompt_covers_all_regions_and_planned_arrivals():
+    assert "на территории Грузии" in SYSTEM_PROMPT
+    assert "Батуми, Тбилиси, Кутаиси" in SYSTEM_PROMPT
+    assert "конкретный план и даты приезда в Грузию" in SYSTEM_PROMPT
+    assert "в любом другом регионе Грузии" in SYSTEM_PROMPT
+
+
+def test_location_rejection_reason_names_georgia():
+    reason = auto_reject_reason(
+        make_score(location_score=0, ai_confidence=95),
+        spam_threshold=85,
+        core_score_max=15,
+        min_ai_confidence=80,
+    )
+    assert reason is not None
+    assert "Грузии" in reason
+    assert "несоответствие" in reason

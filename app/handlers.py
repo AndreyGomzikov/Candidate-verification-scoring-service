@@ -15,6 +15,7 @@ from .db import Database
 from .keyboards import moderation_keyboard
 from .models import Candidate, CandidateStatus
 from .scoring import AIScorer, ScoreResult, auto_reject_reason
+from .support import SupportHandlers
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,9 @@ class GatekeeperHandlers:
         self.settings = settings
         self.db = db
         self.scorer = scorer
+        self.support = SupportHandlers(
+            settings=settings, db=db, is_allowed_admin=self._is_allowed_admin
+        )
 
     async def on_start(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -152,6 +156,7 @@ class GatekeeperHandlers:
 
         candidate = await self.db.get_active_interview(update.effective_user.id)
         if candidate is None:
+            await self.support.on_candidate_message(update, context)
             return
 
         # After the candidate has replied, this is the authoritative private-chat
@@ -409,12 +414,25 @@ class GatekeeperHandlers:
             return
         if not await self._is_allowed_admin(context, update.effective_user.id):
             return
+        # Translate status labels only for Telegram; database values stay unchanged.
+        status_labels = {
+            "interview": "Проходит анкетирование",
+            "scoring": "Проходит AI-проверку",
+            "pending_admin": "Ожидает решения администратора",
+            "approved": "Одобрено",
+            "rejected": "Отклонено администратором",
+            "auto_rejected": "Отклонено автоматически",
+            "expired": "Срок анкеты истёк",
+            "superseded": "Заменено новой заявкой",
+            "error": "Ошибка обработки",
+        }
         counts = await self.db.count_by_status()
         if not counts:
             text = "Заявок пока нет."
         else:
             text = "Статусы заявок:\n" + "\n".join(
-                f"• {key}: {value}" for key, value in sorted(counts.items())
+                f"• {status_labels.get(key, key)}: {value}"
+                for key, value in sorted(counts.items())
             )
         await update.effective_message.reply_text(text)
 
