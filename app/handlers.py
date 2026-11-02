@@ -14,7 +14,10 @@ from .config import Settings
 from .db import Database
 from .keyboards import moderation_keyboard
 from .models import Candidate, CandidateStatus
-from .scoring import AIScorer, ScoreResult, auto_reject_reason
+from .scoring import (
+    AIScorer, ScoreResult, propose_auto_rejection,
+)
+from .decision import GateDecision, decide_auto_rejection
 from .support import SupportHandlers
 
 logger = logging.getLogger(__name__)
@@ -233,12 +236,53 @@ class GatekeeperHandlers:
             await self._send_candidate_message(bot, candidate, texts.PENDING_ADMIN)
             return
 
-        reason = auto_reject_reason(
+        answers = (
+            candidate.location_answer or "",
+            candidate.business_answer or "",
+            candidate.goal_answer or "",
+        )
+        proposal = propose_auto_rejection(
             score,
             spam_threshold=self.settings.auto_reject_spam_score,
             core_score_max=self.settings.auto_reject_core_score_max,
             min_ai_confidence=self.settings.auto_reject_min_ai_confidence,
+            candidate_answers=answers,
         )
+        reason = None
+        review_note = None
+        if proposal is not None:
+            # Only the deterministic third stage can authorize a decline.
+            # Missing reviewer, malformed response, errors and ambiguity abstain.
+            review = None
+            try:
+                review = await self.scorer.review_rejection(
+                    criterion=proposal.criterion,
+                    spam_type=proposal.spam_type,
+                    location=answers[0], business=answers[1], goal=answers[2],
+                )
+            except Exception:
+                logger.exception("Independent AI review failed candidate=%s", candidate.id)
+            try:
+                decision = decide_auto_rejection(
+                    proposal=proposal, review=review, score=score,
+                    candidate_answers=answers,
+                    spam_threshold=self.settings.auto_reject_spam_score,
+                    core_score_max=self.settings.auto_reject_core_score_max,
+                    min_ai_confidence=self.settings.auto_reject_min_ai_confidence,
+                )
+            except Exception:
+                # Fail closed even if an unexpected programming/data error
+                # reaches the otherwise deterministic authorization gate.
+                logger.exception("Decision gate failed candidate=%s", candidate.id)
+                decision = GateDecision(False, "decision_gate_error")
+            if decision.allow_auto_reject:
+                reason = decision.reason
+            else:
+                logger.info("Auto-rejection vetoed candidate=%s gate=%s", candidate.id, decision.code)
+                review_note = (
+                    "🔎 Предложенный автоотказ не прошёл независимый контроль "
+                    "и направлен на решение администратора."
+                )
 
         if reason:
             try:
@@ -290,7 +334,9 @@ class GatekeeperHandlers:
         candidate = await self.db.set_status(
             candidate.id, CandidateStatus.PENDING_ADMIN
         )
-        await self._send_admin_card(bot, candidate, score=score)
+        await self._send_admin_card(
+            bot, candidate, score=score, status_note=review_note
+        )
         await self._send_candidate_message(bot, candidate, texts.PENDING_ADMIN)
 
     async def _is_allowed_admin(
@@ -538,7 +584,20 @@ class GatekeeperHandlers:
                             f"{score.location_score}/100 · Бизнес: {score.business_score}/100 · "
                             f"Цель: {score.intent_score}/100 · Спам-риск: {score.spam_score}/100"
                         ),
-                        f"Уверенность AI: {score.ai_confidence}/100",
+                        (
+                            f"Уверенность AI: {score.ai_confidence}/100 · "
+                            f"Тип спама: {_escape_clip(score.spam_type, 20)}"
+                        ),
+                    ]
+                )
+                if score.spam_evidence:
+                    lines.append(
+                        "Доказательство спама: «"
+                        + _escape_clip(score.spam_evidence, flag_limit)
+                        + "»"
+                    )
+                lines.extend(
+                    [
                         "",
                         "<b>AI-саммари</b>",
                         _escape_clip(score.summary, summary_limit),
