@@ -1,3 +1,4 @@
+from ._adapter import score_as_current as ScoreResult
 """Tests of the third-stage decision gate, the *only* decline authorization."""
 import json
 from dataclasses import replace
@@ -7,7 +8,7 @@ import pytest
 from app.decision import (
     RejectionProposal, decide_auto_rejection, parse_semantic_review,
 )
-from app.scoring import ScoreResult, propose_auto_rejection
+from app.scoring import propose_auto_rejection
 
 LOCATION_NO = "Я сейчас не в Грузии и не планирую приезжать ближайшие годы"
 BUSINESS_NO = "У меня нет бизнеса, нет проектов, нигде не работаю"
@@ -179,7 +180,9 @@ def test_higher_threshold_disables_spam_decline():
 
 def test_low_confidence_disables_auto_decline():
     _, score, _ = scenario("location")
-    assert not evaluate("location", score=replace(score, ai_confidence=79)).allow_auto_reject
+    # The merged system uses confidence for the concrete rejection ground.
+    weakened = replace(score, decision_confidences=(replace(score.decision_confidences[0], score=79),))
+    assert not evaluate("location", score=weakened).allow_auto_reject
 
 
 @pytest.mark.parametrize("payload", [

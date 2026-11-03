@@ -18,6 +18,19 @@ from .scoring import ScoreResult
 logger = logging.getLogger(__name__)
 
 
+def _interrupted_scoring_condition():
+    """Include stage-4 interview rows left by the *previous* non-atomic code."""
+    return or_(
+        Candidate.status == CandidateStatus.SCORING.value,
+        and_(Candidate.status == CandidateStatus.INTERVIEW.value, Candidate.stage == 4),
+    )
+
+
+# Persistent marker makes failed admin-card delivery retryable after restart.
+_RECOVERY_NOTICE_PENDING = "AI scoring interrupted; recovery notice pending"
+_RECOVERY_NOTICE_SENT = "AI scoring interrupted; administrator notified"
+
+
 class Database:
     def __init__(self, url: str):
         self.engine = create_async_engine(url, future=True, hide_parameters=True)
@@ -160,6 +173,97 @@ class Database:
             await session.refresh(candidate)
             return candidate
 
+    async def complete_interview(self, candidate_id: int, answer: str) -> Candidate | None:
+        """Atomically save answer 3 AND enter scoring; no interview/stage=4 gap.
+
+        A repeated Telegram update must not restart scoring for this candidate.
+        """
+        async with self.sessions() as session:
+            result = await session.execute(
+                update(Candidate)
+                .where(
+                    Candidate.id == candidate_id,
+                    Candidate.status == CandidateStatus.INTERVIEW.value,
+                    Candidate.stage == 3,
+                )
+                .values(
+                    goal_answer=answer,
+                    stage=4,
+                    status=CandidateStatus.SCORING.value,
+                    updated_at=datetime.now(timezone.utc),
+                )
+                .returning(Candidate.id)
+            )
+            updated_id = result.scalar_one_or_none()
+            await session.commit()
+            return await session.get(Candidate, updated_id) if updated_id is not None else None
+
+    async def list_stale_scoring(self, cutoff: datetime) -> list[Candidate]:
+        """Find unfinished scoring, including legacy interview/stage=4 rows."""
+        async with self.sessions() as session:
+            result = await session.scalars(
+                select(Candidate)
+                .where(
+                    _interrupted_scoring_condition(),
+                    Candidate.updated_at < cutoff,
+                )
+                .order_by(Candidate.updated_at.asc())
+            )
+            return list(result.all())
+
+    async def recover_scoring_to_admin(self, candidate_id: int, cutoff: datetime) -> Candidate | None:
+        """Claim recovery once; never auto-decline a possibly interrupted request.
+
+        CAS also prevents duplicate recovery cards from two maintenance iterations.
+        """
+        async with self.sessions() as session:
+            result = await session.execute(
+                update(Candidate)
+                .where(
+                    Candidate.id == candidate_id,
+                    _interrupted_scoring_condition(),
+                    Candidate.updated_at < cutoff,
+                )
+                .values(
+                    status=CandidateStatus.PENDING_ADMIN.value,
+                    decision_reason=_RECOVERY_NOTICE_PENDING,
+                    updated_at=datetime.now(timezone.utc),
+                )
+                .returning(Candidate.id)
+            )
+            updated_id = result.scalar_one_or_none()
+            await session.commit()
+            return await session.get(Candidate, updated_id) if updated_id is not None else None
+
+    async def list_pending_recovery_notices(self) -> list[Candidate]:
+        async with self.sessions() as session:
+            result = await session.scalars(
+                select(Candidate)
+                .where(
+                    Candidate.status == CandidateStatus.PENDING_ADMIN.value,
+                    Candidate.decision_reason == _RECOVERY_NOTICE_PENDING,
+                )
+                .order_by(Candidate.id.asc())
+            )
+            return list(result.all())
+
+    async def mark_recovery_notice_sent(self, candidate_id: int) -> bool:
+        async with self.sessions() as session:
+            result = await session.execute(
+                update(Candidate)
+                .where(
+                    Candidate.id == candidate_id,
+                    Candidate.status == CandidateStatus.PENDING_ADMIN.value,
+                    Candidate.decision_reason == _RECOVERY_NOTICE_PENDING,
+                )
+                .values(
+                    decision_reason=_RECOVERY_NOTICE_SENT,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.commit()
+            return result.rowcount == 1
+
     async def get_active_interview(self, user_id: int) -> Candidate | None:
         async with self.sessions() as session:
             stmt = (
@@ -224,6 +328,7 @@ class Database:
                 select(Candidate)
                 .where(
                     Candidate.status == CandidateStatus.INTERVIEW.value,
+                    Candidate.stage <= 3,
                     Candidate.updated_at < cutoff,
                 )
                 .order_by(Candidate.updated_at.asc())

@@ -1,3 +1,4 @@
+from ._adapter import score_as_current as ScoreResult
 """Regression: two LLMs can agree on a *literal* but semantically false quote.
 
 The gate must never trust `supports_rejection` in unrelated answer fields
@@ -10,7 +11,7 @@ import pytest
 from app.decision import (
     decide_auto_rejection, parse_semantic_review, review_contract_failure,
 )
-from app.scoring import ScoreResult, propose_auto_rejection, semantic_review_confirms_rejection
+from app.scoring import propose_auto_rejection, semantic_review_confirms_rejection
 
 LOCATION_NO = "Я сейчас не в Грузии и не планирую приезжать ближайшие годы"
 BUSINESS_NO = "У меня нет бизнеса, нет проектов, нигде не работаю"

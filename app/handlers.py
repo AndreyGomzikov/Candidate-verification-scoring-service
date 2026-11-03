@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import html
 import logging
+import json
+import math
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 
 from telegram import Bot, Update
@@ -15,9 +18,12 @@ from .db import Database
 from .keyboards import moderation_keyboard
 from .models import Candidate, CandidateStatus
 from .scoring import (
-    AIScorer, ScoreResult, propose_auto_rejection,
+    AIScorer, ScoreResult, propose_auto_rejection, with_spam_verification,
+    finalize_candidate_score,
 )
 from .decision import GateDecision, decide_auto_rejection
+from .core_review import CoreVerification
+from .spam_review import SpamVerification
 from .support import SupportHandlers
 
 logger = logging.getLogger(__name__)
@@ -49,6 +55,7 @@ class GatekeeperHandlers:
         self.settings = settings
         self.db = db
         self.scorer = scorer
+        self._active_scoring_ids: set[int] = set()
         self.support = SupportHandlers(
             settings=settings, db=db, is_allowed_admin=self._is_allowed_admin
         )
@@ -80,10 +87,10 @@ class GatekeeperHandlers:
                 await self._send_candidate_message(
                     context.bot, active, self._question_for_stage(active.stage)
                 )
+            elif active.status == CandidateStatus.SCORING.value:
+                await self._send_candidate_message(context.bot, active, texts.PROCESSING)
             else:
-                await self._send_candidate_message(
-                    context.bot, active, texts.PENDING_ADMIN
-                )
+                await self._send_candidate_message(context.bot, active, texts.PENDING_ADMIN)
             return
 
         if self.settings.reapplication_cooldown_minutes > 0:
@@ -199,133 +206,190 @@ class GatekeeperHandlers:
         if candidate.stage != 3:
             return
 
-        candidate = await self.db.save_answer(
-            candidate.id,
-            field="goal_answer",
-            answer=answer,
-            next_stage=4,
-        )
-        await self.db.set_status(candidate.id, CandidateStatus.SCORING)
-        await update.effective_message.reply_text(texts.PROCESSING)
-        candidate = await self.db.get_candidate(candidate.id)
+        # One transaction prevents a crash from leaving stage=4 in interview.
+        candidate = await self.db.complete_interview(candidate.id, answer)
         if candidate is None:
-            return
+            return  # duplicate delivery or already processed by another handler
+        # Candidate messaging is best effort; an outage must not suppress AI.
+        try:
+            await update.effective_message.reply_text(texts.PROCESSING)
+        except TelegramError:
+            logger.warning(
+                "Candidate processing notification failed candidate=%s; scoring continues",
+                candidate.id,
+            )
         await self._score_and_route(context.bot, candidate)
 
     async def _score_and_route(self, bot: Bot, candidate: Candidate) -> None:
+        """Track live work so maintenance never recovers an in-flight LLM call."""
+        self._active_scoring_ids.add(candidate.id)
         try:
-            score, raw = await self.scorer.score(
-                location=candidate.location_answer or "",
-                business=candidate.business_answer or "",
-                goal=candidate.goal_answer or "",
-            )
-            candidate = await self.db.save_score(candidate.id, score, raw)
-        except Exception as exc:
-            logger.exception("AI scoring failed for candidate=%s", candidate.id)
-            candidate = await self.db.set_status(
-                candidate.id,
-                CandidateStatus.PENDING_ADMIN,
-                reason=f"AI scoring error: {type(exc).__name__}",
-            )
-            await self._send_admin_card(
-                bot,
-                candidate,
-                score=None,
-                scoring_error="AI-скоринг временно недоступен; требуется решение администратора.",
-            )
-            await self._send_candidate_message(bot, candidate, texts.PENDING_ADMIN)
-            return
+            await self._score_and_route_untracked(bot, candidate)
+        finally:
+            self._active_scoring_ids.discard(candidate.id)
 
+    async def _score_and_route_untracked(self, bot: Bot, candidate: Candidate) -> None:
+        """Three stages: model proposal → independent v3 review → pure Python gate.
+
+        The only path to decline_chat_join_request passes a positive
+        GateDecision. Malformed reviews, failed requests, weak/unknown evidence
+        and exceptions all default to administrator moderation.
+        """
         answers = (
             candidate.location_answer or "",
             candidate.business_answer or "",
             candidate.goal_answer or "",
         )
-        proposal = propose_auto_rejection(
-            score,
-            spam_threshold=self.settings.auto_reject_spam_score,
-            core_score_max=self.settings.auto_reject_core_score_max,
-            min_ai_confidence=self.settings.auto_reject_min_ai_confidence,
-            candidate_answers=answers,
-        )
-        reason = None
-        review_note = None
-        if proposal is not None:
-            # Only the deterministic third stage can authorize a decline.
-            # Missing reviewer, malformed response, errors and ambiguity abstain.
-            review = None
-            try:
-                review = await self.scorer.review_rejection(
-                    criterion=proposal.criterion,
-                    spam_type=proposal.spam_type,
-                    location=answers[0], business=answers[1], goal=answers[2],
-                )
-            except Exception:
-                logger.exception("Independent AI review failed candidate=%s", candidate.id)
-            try:
-                decision = decide_auto_rejection(
-                    proposal=proposal, review=review, score=score,
-                    candidate_answers=answers,
-                    spam_threshold=self.settings.auto_reject_spam_score,
-                    core_score_max=self.settings.auto_reject_core_score_max,
-                    min_ai_confidence=self.settings.auto_reject_min_ai_confidence,
-                )
-            except Exception:
-                # Fail closed even if an unexpected programming/data error
-                # reaches the otherwise deterministic authorization gate.
-                logger.exception("Decision gate failed candidate=%s", candidate.id)
-                decision = GateDecision(False, "decision_gate_error")
-            if decision.allow_auto_reject:
-                reason = decision.reason
-            else:
-                logger.info("Auto-rejection vetoed candidate=%s gate=%s", candidate.id, decision.code)
-                review_note = (
-                    "🔎 Предложенный автоотказ не прошёл независимый контроль "
-                    "и направлен на решение администратора."
-                )
+        proposal = None
+        review = None
+        review_error = None
+        decision = GateDecision(False, "no_proposal")
+        try:
+            score, raw = await self.scorer.score(
+                location=answers[0], business=answers[1], goal=answers[2]
+            )
+            proposal = propose_auto_rejection(
+                score,
+                spam_threshold=self.settings.auto_reject_spam_score,
+                core_score_max=self.settings.auto_reject_core_score_max,
+                min_ai_confidence=self.settings.auto_reject_min_ai_confidence,
+                candidate_answers=answers,
+            )
+            logger.info(
+                "Stage1 candidate=%s criterion=%s ai_confidence=%s "
+                "criterion_confidence=%s spam_score=%s result=%s",
+                candidate.id, proposal.criterion if proposal else "none",
+                score.ai_confidence,
+                score.confidence_for(proposal.criterion) if proposal else 0,
+                score.spam_score, "proposed" if proposal else "manual",
+            )
+            if proposal is not None:
+                try:
+                    review = await self.scorer.review_rejection(
+                        criterion=proposal.criterion, spam_type=proposal.spam_type,
+                        location=answers[0], business=answers[1], goal=answers[2],
+                    )
+                    logger.info(
+                        "Stage2 candidate=%s criterion=%s verdict=%s "
+                        "field_checks=%s consistency=%s eligibility=%s",
+                        candidate.id, proposal.criterion, review.verdict,
+                        dict(review.field_checks), review.overall_consistency,
+                        review.eligibility_signal,
+                    )
+                except Exception as exc:
+                    review_error = type(exc).__name__
+                    logger.warning(
+                        "Stage2 candidate=%s criterion=%s unavailable error=%s",
+                        candidate.id, proposal.criterion, review_error,
+                    )
+                try:
+                    decision = decide_auto_rejection(
+                        proposal=proposal, review=review, score=score,
+                        candidate_answers=answers,
+                        spam_threshold=self.settings.auto_reject_spam_score,
+                        core_score_max=self.settings.auto_reject_core_score_max,
+                        min_ai_confidence=self.settings.auto_reject_min_ai_confidence,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Stage3 candidate=%s unexpected gate error=%s",
+                        candidate.id, type(exc).__name__,
+                    )
+                    decision = GateDecision(False, "decision_gate_error")
+            logger.info(
+                "Stage3 candidate=%s criterion=%s allow=%s code=%s",
+                candidate.id, proposal.criterion if proposal else "none",
+                decision.allow_auto_reject, decision.code,
+            )
+            # Show stage-2/3 outcome in the admin card, without implying that
+            # agreement by both models alone authorizes a decline.
+            if proposal is not None and proposal.criterion in ("location", "business"):
+                score = replace(score, core_verifications=(CoreVerification(
+                    proposal.criterion,
+                    "confirmed" if decision.allow_auto_reject else "not_confirmed",
+                    f"Decision Gate: {decision.code}",
+                    proposal.evidence_quote if decision.allow_auto_reject else "",
+                ),))
+            if proposal is not None and proposal.criterion == "spam":
+                if decision.allow_auto_reject:
+                    original = next((e for e in score.spam_evidence
+                                     if e.quote == proposal.evidence_quote), None)
+                    spam_verdict = SpamVerification(
+                        "confirmed", "Stage 2 и Decision Gate подтвердили нарушение",
+                        original.category if original else "",
+                        original.source_field if original else "",
+                        original.quote if original else "",
+                    )
+                else:
+                    spam_verdict = SpamVerification(
+                        "not_confirmed", f"Decision Gate: {decision.code}"
+                    )
+                score, raw = with_spam_verification(score, raw, spam_verdict)
+            score, raw = finalize_candidate_score(
+                score, raw, spam_threshold=self.settings.auto_reject_spam_score
+            )
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                payload = {"model_response": payload}
+            payload["_gatekeeper_decision"] = {
+                "version": 3,
+                "stage1_proposal": asdict(proposal) if proposal else None,
+                "stage1_criterion_confidence": (
+                    score.confidence_for(proposal.criterion) if proposal else None
+                ),
+                "stage2_review": asdict(review) if review else None,
+                "stage2_error_type": review_error,
+                "stage3": {"allow_auto_reject": decision.allow_auto_reject,
+                           "code": decision.code,
+                           "reason": decision.reason},
+            }
+            candidate = await self.db.save_score(
+                candidate.id, score, json.dumps(payload, ensure_ascii=False)
+            )
+        except Exception as exc:
+            logger.exception("AI scoring/routing failed for candidate=%s", candidate.id)
+            candidate = await self.db.set_status(
+                candidate.id, CandidateStatus.PENDING_ADMIN,
+                reason=f"AI scoring error: {type(exc).__name__}",
+            )
+            await self._send_admin_card(
+                bot, candidate, score=None,
+                scoring_error="AI-скоринг временно недоступен; требуется решение администратора.",
+            )
+            await self._send_candidate_message(bot, candidate, texts.PENDING_ADMIN)
+            return
 
+        # The bot must never decline solely based on the first score or
+        # independent AI verdict; only a deterministic positive gate is enough.
+        reason = decision.reason if decision.allow_auto_reject else None
         if reason:
             try:
                 await bot.decline_chat_join_request(
                     chat_id=candidate.target_chat_id, user_id=candidate.user_id
                 )
             except TelegramError as exc:
-                # Keep Telegram and DB consistent: if decline failed, the request is
-                # NOT marked rejected. Give admins a chance to retry/inspect.
-                logger.exception(
-                    "Failed to decline join request candidate=%s", candidate.id
-                )
+                logger.exception("Failed to decline join request candidate=%s", candidate.id)
                 candidate = await self.db.set_status(
-                    candidate.id,
-                    CandidateStatus.PENDING_ADMIN,
-                    reason=(
-                        f"AI рекомендовал автоотказ: {reason}. "
-                        f"Telegram decline failed: {type(exc).__name__}"
-                    ),
+                    candidate.id, CandidateStatus.PENDING_ADMIN,
+                    reason=(f"Decision Gate разрешил автоотказ: {reason}. "
+                            f"Telegram decline failed: {type(exc).__name__}"),
                 )
                 await self._send_admin_card(
-                    bot,
-                    candidate,
-                    score=score,
-                    status_note=(
-                        "⚠️ AI рекомендовал автоотказ, но Telegram не подтвердил "
-                        "отклонение. Заявка оставлена на решение администратора."
-                    ),
+                    bot, candidate, score=score,
+                    status_note=("⚠️ Decision Gate разрешил автоотказ, но Telegram "
+                                 "не подтвердил отклонение. Решает администратор."),
                     with_buttons=True,
                 )
-                await self._send_candidate_message(
-                    bot, candidate, texts.TECHNICAL_REVIEW
-                )
+                await self._send_candidate_message(bot, candidate, texts.TECHNICAL_REVIEW)
                 return
-
             candidate = await self.db.set_status(
                 candidate.id, CandidateStatus.AUTO_REJECTED, reason=reason
             )
+            logger.info("Telegram auto-decline completed candidate=%s gate=%s",
+                        candidate.id, decision.code)
             await self._send_candidate_message(bot, candidate, texts.REJECTED)
             await self._send_admin_card(
-                bot,
-                candidate,
-                score=score,
+                bot, candidate, score=score,
                 status_note="🤖 Заявка автоматически отклонена: " + reason,
                 with_buttons=False,
             )
@@ -334,9 +398,12 @@ class GatekeeperHandlers:
         candidate = await self.db.set_status(
             candidate.id, CandidateStatus.PENDING_ADMIN
         )
-        await self._send_admin_card(
-            bot, candidate, score=score, status_note=review_note
+        status_note = (
+            "🔎 Предложенный автоотказ не прошёл независимый контроль "
+            f"({decision.code}). Требуется решение администратора."
+            if proposal is not None else None
         )
+        await self._send_admin_card(bot, candidate, score=score, status_note=status_note)
         await self._send_candidate_message(bot, candidate, texts.PENDING_ADMIN)
 
     async def _is_allowed_admin(
@@ -482,6 +549,58 @@ class GatekeeperHandlers:
             )
         await update.effective_message.reply_text(text)
 
+    async def recover_stale_scoring(self, bot: Bot, *, startup: bool = False) -> int:
+        """Fail closed after a crash/timeout: manual moderation, NEVER auto-reject.
+
+        At startup no scoring coroutine from this process is alive, so recover
+        all unfinished rows immediately. During normal operation only recover
+        old rows not currently being handled by this process.
+        """
+        now = datetime.now(timezone.utc)
+        # Enough time for two sequential LLM calls plus DB/Telegram overhead.
+        grace_minutes = max(10, math.ceil(3 * self.settings.llm_timeout_seconds / 60) + 2)
+        cutoff = now + timedelta(seconds=1) if startup else now - timedelta(minutes=grace_minutes)
+        stale = await self.db.list_stale_scoring(cutoff)
+        count = 0
+        for item in stale:
+            if item.id in self._active_scoring_ids:
+                continue
+            recovered = await self.db.recover_scoring_to_admin(item.id, cutoff)
+            if recovered is not None:
+                count += 1
+                logger.warning(
+                    "Scoring recovery candidate=%s mode=%s previous_status=%s "
+                    "new_status=pending_admin reason=interrupted",
+                    item.id, "startup" if startup else "stale", item.status,
+                )
+        # Retry unsent recovery cards persistently, including if Telegram was
+        # unavailable on the first attempt or the process crashed after CAS.
+        for item in await self.db.list_pending_recovery_notices():
+            try:
+                await self._send_admin_card(
+                    bot, item, score=None,
+                    scoring_error=(
+                        "AI-проверка прервалась или не завершилась. "
+                        "Восстановление не выполняет автоотказ. "
+                        "Проверьте, осталась ли заявка в Telegram: "
+                        "действие до сбоя могло уже произойти."
+                    ),
+                    with_buttons=True,
+                )
+            except TelegramError:
+                logger.warning(
+                    "Scoring recovery admin notice failed candidate=%s; retry later",
+                    item.id,
+                )
+                continue
+            except Exception:
+                logger.exception("Unexpected recovery notice error candidate=%s", item.id)
+                continue
+            if await self.db.mark_recovery_notice_sent(item.id):
+                logger.info("Scoring recovery admin notified candidate=%s", item.id)
+                await self._send_candidate_message(bot, item, texts.PENDING_ADMIN)
+        return count
+
     async def expire_stale_interviews(self, bot: Bot) -> int:
         """Close abandoned questionnaires so pending join requests do not hang forever."""
         cutoff = datetime.now(timezone.utc) - timedelta(
@@ -578,31 +697,87 @@ class GatekeeperHandlers:
             if score is not None:
                 lines.extend(
                     [
-                        f"<b>Confidence Score:</b> {score.confidence_score}/100",
+                        (
+                            f"<b>Confidence Score (без неподтверждённого спам-штрафа):</b> "
+                            f"{score.confidence_score}/100"
+                            if score.spam_penalty_withheld else
+                            f"<b>Confidence Score:</b> {score.confidence_score}/100"
+                        ),
                         (
                             "Локация: "
                             f"{score.location_score}/100 · Бизнес: {score.business_score}/100 · "
                             f"Цель: {score.intent_score}/100 · Спам-риск: {score.spam_score}/100"
                         ),
-                        (
-                            f"Уверенность AI: {score.ai_confidence}/100 · "
-                            f"Тип спама: {_escape_clip(score.spam_type, 20)}"
-                        ),
-                    ]
-                )
-                if score.spam_evidence:
-                    lines.append(
-                        "Доказательство спама: «"
-                        + _escape_clip(score.spam_evidence, flag_limit)
-                        + "»"
-                    )
-                lines.extend(
-                    [
+                        f"Уверенность оценки: {score.ai_confidence}/100",
                         "",
                         "<b>AI-саммари</b>",
                         _escape_clip(score.summary, summary_limit),
                     ]
                 )
+                if score.spam_penalty_withheld:
+                    lines.extend([
+                        f"<b>Исходный Score со спам-штрафом:</b> "
+                        f"{score.preliminary_confidence_score}/100",
+                        "⚠️ Высокий спам-риск модели не подтверждён для автоотказа. "
+                        "Оценка без штрафа предварительная; требуется решение модератора.",
+                    ])
+                if score.core_verifications:
+                    for review in score.core_verifications:
+                        name = "Локация" if review.field == "location" else "Бизнес"
+                        label = ("подтверждено" if review.permits_auto_reject
+                                 else "НЕ подтверждено для автоотказа")
+                        lines.append(
+                            f"<b>Проверка {name}:</b> {label} — "
+                            + _escape_clip(review.reason, 145)
+                        )
+                elif (
+                    score.location_score <= getattr(self.settings, "auto_reject_core_score_max", 15)
+                    or score.business_score <= getattr(self.settings, "auto_reject_core_score_max", 15)
+                ):
+                    lines.append("⚠️ Критически низкий балл: нет подтверждения для автоотказа")
+                if score.decision_confidences:
+                    names = {"location": "локации", "business": "бизнесу",
+                             "spam": "спаму"}
+                    for grade in score.decision_confidences[:3]:
+                        lines.append(
+                            f"<b>Уверенность по {names.get(grade.criterion, grade.criterion)}:</b> "
+                            f"{grade.score}/100 · "
+                            f"полнота {grade.completeness} · цитата {grade.specificity} · "
+                            f"согласованность {grade.consistency} · "
+                            f"определённость {grade.certainty}"
+                        )
+                if score.confidence_details is not None:
+                    details = score.confidence_details
+                    lines.insert(
+                        -3,
+                        "<b>Основания уверенности:</b> "
+                        f"полнота {details.completeness} · "
+                        f"цитаты {details.specificity} · "
+                        f"согласованность {details.consistency} · "
+                        f"определённость {details.certainty}",
+                    )
+                    # The global rubric can be incomplete while a specific
+                    # reason has grounded evidence. Do not mislabel this as
+                    # a ban on stage-3 assessment of the specific ground.
+                    if details.notes and not any(
+                        grade.evidence_verified for grade in score.decision_confidences
+                    ):
+                        lines.extend([
+                            "",
+                            "⚠️ " + _escape_clip(details.notes[-1], 140),
+                        ])
+                if score.spam_score >= getattr(self.settings, "auto_reject_spam_score", 85):
+                    verdict = score.spam_verification
+                    if verdict is None:
+                        spam_note = "Подтверждение спама не проводилось (низкая уверенность)"
+                    elif verdict.permits_auto_reject:
+                        spam_note = "Повторная проверка подтвердила явные признаки спама"
+                    else:
+                        spam_note = (
+                            "Спам не подтверждён для автоотказа: " + verdict.reason
+                        )
+                    lines.extend(["", "<b>Проверка спам-риска:</b>",
+                                  _escape_clip(spam_note, 280)])
                 if score.risk_flags:
                     lines.extend(
                         [
@@ -641,8 +816,10 @@ class GatekeeperHandlers:
         if score is not None:
             minimal.extend(
                 [
-                    f"<b>Confidence Score:</b> {score.confidence_score}/100",
-                    f"Спам-риск: {score.spam_score}/100 · Уверенность AI: {score.ai_confidence}/100",
+                    f"<b>Confidence Score{' (без неподтверждённого спам-штрафа)' if score.spam_penalty_withheld else ''}:</b> {score.confidence_score}/100",
+                    f"Спам-риск: {score.spam_score}/100 · Уверенность оценки: {score.ai_confidence}/100",
+                    *([f"Исходный Score: {score.preliminary_confidence_score}/100"]
+                      if score.spam_penalty_withheld else []),
                     "<b>AI-саммари</b>",
                     _escape_clip(score.summary, 180),
                 ]
@@ -688,7 +865,9 @@ class GatekeeperHandlers:
                 "Новая заявка Solidus\n"
                 f"Кандидат: {self._candidate_name(candidate)}\n"
                 f"Telegram ID: {candidate.user_id}\n"
-                f"Confidence Score: {score.confidence_score if score else 'нет'}\n"
+                f"Confidence Score: {score.confidence_score if score else 'нет'}"
+                f"{' (без неподтверждённого спам-штрафа)' if score and score.spam_penalty_withheld else ''}\n"
+                f"{'Исходный Score со штрафом: ' + str(score.preliminary_confidence_score) + chr(10) if score and score.spam_penalty_withheld else ''}"
                 "Подробная карточка не отправилась из-за ошибки форматирования."
             )
             await bot.send_message(

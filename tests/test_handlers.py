@@ -10,9 +10,8 @@ from app import texts
 from app.config import Settings
 from app.handlers import GatekeeperHandlers
 from app.models import Candidate, CandidateStatus
-from app.scoring import ScoreResult
-from app.decision import parse_semantic_review
-import json
+from app.scoring import ScoreResult, with_spam_verification
+from app.spam_review import SpamVerification
 
 
 def settings() -> Settings:
@@ -98,73 +97,14 @@ class RejectFailBot:
 
 
 class SpamScorer:
-    async def review_rejection(self, **kwargs):
-        return parse_semantic_review(json.dumps({
-            "schema_version": 3, "verdict": "reject", "criterion": "spam", "spam_type": "advertising",
-            "field_checks": {"location": "no_relevant_information",
-                             "business": "no_relevant_information",
-                             "goal": "supports_rejection"},
-            "no_relevance_basis": {"location": "explicit_neutral", "business": "explicit_neutral",
-                                   "goal": "not_applicable"},
-            "field_evidence": {
-                "location": {"supporting_quotes": [], "contradicting_quotes": [], "uncertainty_reason": ""},
-                "business": {"supporting_quotes": [], "contradicting_quotes": [], "uncertainty_reason": ""},
-                "goal": {"supporting_quotes": ["Пишите в ЛС: Заработок 500$ в день без вложений!"],
-                         "contradicting_quotes": [], "uncertainty_reason": ""},
-            },
-            "overall_consistency": "consistent", "eligibility_signal": "absent",
-            "explanation_code": "explicit_spam",
-            "evidence_quote": "Пишите в ЛС: Заработок 500$ в день без вложений!",
-        }))
-
     async def score(self, **kwargs):
-        result = score(
-            spam_score=99,
-            ai_confidence=99,
-            confidence_score=20,
-            spam_type="advertising",
-            spam_evidence="Пишите в ЛС: Заработок 500$ в день без вложений",
-        )
+        result = score(spam_score=99, ai_confidence=99, confidence_score=20)
         return result, "{}"
 
-
-class HallucinatedEvidenceScorer:
-    async def score(self, **kwargs):
-        result = score(
-            spam_score=99,
-            ai_confidence=99,
-            spam_type="fraud",
-            spam_evidence="Заработок 500$ в день без вложений",
+    async def confirm_high_spam(self, *, score, raw, **kwargs):
+        return with_spam_verification(
+            score, raw, SpamVerification("confirmed", "Явное массовое навязывание рекламы")
         )
-        return result, "{}"
-
-
-class RecordingBot:
-    def __init__(self):
-        self.sent: list[tuple[int, str]] = []
-        self.declined = 0
-
-    async def decline_chat_join_request(self, **kwargs):
-        self.declined += 1
-
-    async def send_message(self, chat_id, text, **kwargs):
-        self.sent.append((chat_id, text))
-        return SimpleNamespace(message_id=1)
-
-
-def test_spam_with_quote_not_in_answers_goes_to_admin():
-    item = candidate(status=CandidateStatus.SCORING.value, stage=4)
-    db = RoutingDB(item)
-    bot = RecordingBot()
-    handler = GatekeeperHandlers(
-        settings=settings(), db=db, scorer=HallucinatedEvidenceScorer()
-    )
-
-    asyncio.run(handler._score_and_route(bot, item))
-
-    assert bot.declined == 0
-    assert db.statuses[-1] == CandidateStatus.PENDING_ADMIN
-    assert CandidateStatus.AUTO_REJECTED not in db.statuses
 
 
 def test_admin_card_stays_under_telegram_limit_with_hostile_html():
@@ -178,7 +118,6 @@ def test_admin_card_stays_under_telegram_limit_with_hostile_html():
     result = score(
         summary="<" * 1000,
         risk_flags=["&" * 180 for _ in range(8)],
-        spam_evidence="<" * 300,
     )
     handler = GatekeeperHandlers(settings=settings(), db=object(), scorer=NoopScorer())
     card = handler._build_admin_card(
@@ -201,10 +140,7 @@ def test_candidate_notifications_use_user_chat_id_not_user_id():
 
 
 def test_failed_auto_decline_does_not_mark_candidate_rejected():
-    item = candidate(status=CandidateStatus.SCORING.value, stage=4,
-                     location_answer="Нет дополнительных сведений",
-                     business_answer="Не знаю",
-                     goal_answer="Пишите в ЛС: «Заработок 500$ в день без вложений!»")
+    item = candidate(status=CandidateStatus.SCORING.value, stage=4)
     db = RoutingDB(item)
     bot = RejectFailBot()
     handler = GatekeeperHandlers(settings=settings(), db=db, scorer=SpamScorer())
@@ -215,7 +151,9 @@ def test_failed_auto_decline_does_not_mark_candidate_rejected():
     assert CandidateStatus.AUTO_REJECTED not in db.statuses
     candidate_texts = [text for chat_id, text in bot.sent if chat_id == item.user_chat_id]
     assert texts.REJECTED not in candidate_texts
-    assert texts.TECHNICAL_REVIEW in candidate_texts
+    # Only the old first-stage evidence is present; absence of a v3 review
+    # must go to manual moderation, NOT attempt Telegram decline.
+    assert texts.PENDING_ADMIN in candidate_texts
 
 
 def test_admin_api_failure_keeps_pending_status_and_buttons():
@@ -337,22 +275,3 @@ def test_approval_notifies_candidate_with_exact_link():
         for call in bot.send_message.await_args_list
     )
     db.set_status.assert_awaited_once()
-
-
-class IncorrectCoreScorer:
-    async def score(self, **kwargs):
-        return score(location_score=0, business_score=0, ai_confidence=100,
-                     location_mismatch_evidence="Я живу в Тбилиси",
-                     business_mismatch_evidence="Владелец IT-компании"), "{}"
-
-
-def test_routing_refuses_false_auto_core_rejection():
-    item = candidate(status=CandidateStatus.SCORING.value, stage=4,
-                     location_answer="Я живу в Тбилиси",
-                     business_answer="Владелец IT-компании")
-    db = RoutingDB(item)
-    bot = RecordingBot()
-    handler = GatekeeperHandlers(settings=settings(), db=db, scorer=IncorrectCoreScorer())
-    asyncio.run(handler._score_and_route(bot, item))
-    assert bot.declined == 0
-    assert db.statuses[-1] == CandidateStatus.PENDING_ADMIN

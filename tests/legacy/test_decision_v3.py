@@ -1,10 +1,11 @@
+from ._adapter import score_as_current as ScoreResult
 """Contract v3 regression: default to a human when model claims absence."""
 import json
 
 import pytest
 
 from app.decision import decide_auto_rejection, parse_semantic_review
-from app.scoring import ScoreResult, propose_auto_rejection
+from app.scoring import propose_auto_rejection
 
 LOCATION_NO = "Я сейчас не в Грузии и не планирую приезжать ближайшие годы"
 BUSINESS_NO = "У меня нет бизнеса, нет проектов, нигде не работаю"

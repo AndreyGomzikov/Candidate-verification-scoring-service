@@ -1,3 +1,4 @@
+from ._adapter import score_as_current as ScoreResult
 """Regression: contradictory qualifications inside the PRIMARY answer are not
 made safe by two LLMs agreeing on an incomplete negative excerpt.
 
@@ -12,7 +13,7 @@ from app.decision import (
     RejectionProposal, decide_auto_rejection, parse_semantic_review,
     review_contract_failure,
 )
-from app.scoring import ScoreResult, propose_auto_rejection
+from app.scoring import propose_auto_rejection
 
 LOCATION_NEGATIVE = 'Я сейчас не в Грузии и не планирую приезжать ближайшие годы'
 BUSINESS_NEGATIVE = 'У меня нет бизнеса, нет проектов, нигде не работаю'
