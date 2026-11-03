@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -457,6 +458,38 @@ def _bounded_int(value: object, field: str) -> int:
     return result
 
 
+
+def _parse_ai_confidence(value: object) -> int:
+    """Normalize AI confidence to an integer percentage without rounding up.
+
+    The prompt requests 0..100, but some LLMs reply with a probability 0..1.
+    Accept proper percentages as-is; strictly fractional numbers (0, 1)
+    are scaled to percentages. Never treat the ambiguous endpoint 1 as 100.
+    Unknown, non-finite and out-of-range values fail scoring, so the caller
+    sends the application to an administrator rather than auto-rejecting it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("ai_confidence must be a number from 0 to 100")
+    try:
+        # Decimal(str(value)) avoids floating-point off-by-one near thresholds
+        # (e.g. 0.29 must become 29, not 28).
+        raw = str(value).strip()
+        if not re.fullmatch(r"(?:0|[1-9]\d{0,2})(?:\.\d+)?", raw):
+            raise ValueError("ai_confidence has an unsupported numeric format")
+        number = Decimal(raw)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("ai_confidence has an unsupported numeric format") from exc
+
+    if not number.is_finite() or not 0 <= number <= 100:
+        raise ValueError("ai_confidence must be between 0 and 100")
+    if 0 < number < 1:
+        # Floor rather than round to avoid turning 79.9% into the >=80%
+        # threshold for an irreversible automatic rejection.
+        return int((number * 100).to_integral_value(rounding=ROUND_FLOOR))
+    if number != number.to_integral_value():
+        raise ValueError("ai_confidence percentage must be an integer")
+    return int(number)
+
 def calculate_confidence_score(
     location_score: int,
     business_score: int,
@@ -691,7 +724,7 @@ def parse_score_json(content: str) -> ScoreResult:
     business = _bounded_int(payload.get("business_score"), "business_score")
     intent = _bounded_int(payload.get("intent_score"), "intent_score")
     spam = _bounded_int(payload.get("spam_score"), "spam_score")
-    ai_conf = _bounded_int(payload.get("ai_confidence"), "ai_confidence")
+    ai_conf = _parse_ai_confidence(payload.get("ai_confidence"))
     summary = str(payload.get("summary", "")).strip()
     if not summary:
         raise ValueError("summary is required")
@@ -793,6 +826,8 @@ spam_evidence — ДОСЛОВНАЯ цитата (без перефразиро
 Если spam_type "none" или "low_effort" — пустая строка "".
 Сомнения и неполнота ответов — повод снизить ai_confidence, а не повысить spam_score.
 5) ai_confidence: насколько ты уверен в этой оценке с учетом полноты ответов.
+Верни СТРОГО целое число процентов от 0 до 100 (например, 70 или 85),
+НЕ долю от 0 до 1 (не 0.7, не 0.85), не строку и не значение с символом %.
 
 Верни ТОЛЬКО JSON без markdown и пояснений:
 {
