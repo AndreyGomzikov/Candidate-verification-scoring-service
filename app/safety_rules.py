@@ -312,6 +312,68 @@ def _explicit_business_mismatch(
                 and not other_professional_activity and not ambiguity)
 
 
+
+def _verified_non_spam_context(field: str, answer: str) -> bool:
+    """Conservative third-gate allowance for substantive non-spam facts.
+
+    A second model may say that a candidate lives in Georgia or works in
+    marketing while separately confirming an explicit spam pitch. Those facts
+    do not refute an intention to advertise. Still, an unknown free-form
+    statement is NOT trusted merely because the model calls it context: only
+    simple, affirmative location/profession descriptions pass here. Everything
+    else (including contradictory intent, quotations and reported speech)
+    requires a moderator. This never supplies positive evidence of spam.
+    """
+    if field not in ("location", "business") or not isinstance(answer, str):
+        return False
+    raw = unicodedata.normalize("NFKC", answer.strip())
+    if not raw or len(raw) > 300:
+        return False
+    # A single declarative sentence with comma-separated clauses is allowed.
+    # Never discard question marks, quotes, nested sentences or instructions.
+    if not re.fullmatch(r"[\w]+(?:[ \t]+[\w]+|[ \t]*,[ \t]+[\w]+)*\.?", raw):
+        return False
+    normalized = _words(raw)
+    # Unfamiliar qualifications/negations are potential exculpatory evidence;
+    # missing them must never make a mistaken auto-reject possible.
+    if re.search(
+        r"\b(?:не|нет|ни|но|однако|хотя|если|например|цитата|цитирую|"
+        r"передаю|сообщают|пишут|якобы|собираюсь|планирую|намерен|хочу|"
+        r"обман\w*|мошеннич\w*|инструкц\w*|игнорир\w*|бот\w*|"
+        r"not|no|never|but|although|if|however|example|quote|quoted|"
+        r"reportedly|ignore|instructions)\b",
+        normalized,
+    ):
+        return False
+    if _has_spam_warning_or_reported_context(raw):
+        return False
+    # A separate pitch/abusive instruction cannot be hidden in "context_only".
+    if re.search(
+        r"\b(?:рассыл\w*|спам\w*|пишите|покупайте|купите|"
+        r"переходите|подписывайтесь|заказывайте|заработайте|"
+        r"высылаю|продам|рекламирую|продвигаю|"
+        r"buy now|dm me|click the link|mass mailing)\b",
+        normalized,
+    ):
+        return False
+    if field == "location":
+        return bool(re.search(
+            r"\b(?:живу|проживаю|нахожусь|расположен|живем|"
+            r"переехал|переехала|буду жить|сейчас нахожусь)\s+"
+            r"(?:сейчас\s+)?(?:в|на)\s+[\w]+",
+            normalized,
+        ))
+    return bool(
+        _mentions_professional_activity(raw)
+        or re.search(
+            r"\b(?:предприниматель|владелец|руководитель|менеджер|"
+            r"инвестор|учредитель|соучредитель|"
+            r"работаю|руковожу|владею)\b",
+            normalized,
+        )
+    )
+
+
 def _has_spam_warning_or_reported_context(text: str) -> bool:
     """Abstain if an apparent pitch is negated, quoted or condemned.
 
@@ -319,9 +381,35 @@ def _has_spam_warning_or_reported_context(text: str) -> bool:
     phrase from a longer warning (e.g. "НЕ покупайте этот курс"). This gate
     intentionally favors human review over mistakenly declining a candidate.
     """
+    # An isolated sales quote or question is not independently verified intent.
+    # Retain the original punctuation before tokenization instead of
+    # accidentally treating a quoted/reported instruction as the candidate's.
+    raw = unicodedata.normalize("NFKC", str(text or ""))
+    if any(marker in raw for marker in (*_QUOTE_CHARS, "?", "…", "...")):
+        return True
     full = _words(text)
+    # An open-ended negation can reverse the meaning of a sales quote in
+    # unpredictable natural language. Except for the strictly neutral answers
+    # below, leave such mixed profiles to an administrator rather than trying
+    # to infer the scope of the negation from a matching keyword.
+    neutral = {
+        "нет", "нет данных", "нет дополнительных сведений", "не знаю",
+        "не указано", "не применимо", "no information",
+        "no additional information", "none", "not applicable", "no comment",
+    }
+    if full not in neutral and re.search(
+        r"\b(?:не|нет|ни|not|no|never)\b", full
+    ):
+        return True
     return bool(re.search(
-        r"\b(?:не (?:[\w]+ ){0,3}(?:покупайте|купите|переходите|"
+        r"\b(?:не (?:буду|собираюсь|планирую|хочу|намерен|стану) "
+        r"(?:[\w]+ ){0,5}?(?:рассыл\w*|реклам\w*|спам\w*|"
+        r"продава\w*|предлага\w*)|"
+        r"не (?:рассыл\w*|рекламир\w*|спамлю|продаю|предлагаю)|"
+        r"отказываюсь от (?:реклам\w*|рассыл\w*|спам\w*)|"
+        r"это (?:был|была|было) (?:пример|цитата|шутка)|"
+        r"спам выглядит так|это чужая реклама|мне (?:прислали|написали)|"
+        r"не (?:[\w]+ ){0,3}(?:покупайте|купите|переходите|"
         r"подписывайтесь|заказывайте|пишите|верьте|отправляйте|"
         r"игнорируй|игнорируйте|рассылаю)|"
         r"не (?:[\w]+ ){0,5}(?:массов\w*|рассылк\w*|"

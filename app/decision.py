@@ -16,10 +16,11 @@ if TYPE_CHECKING:
     from .scoring import ScoreResult
 
 Criterion = Literal["location", "business", "spam"]
-Status = Literal["supports_rejection", "no_relevant_information", "contradicts", "uncertain"]
+Status = Literal["supports_rejection", "no_relevant_information", "context_only", "contradicts", "uncertain"]
 FIELDS = ("location", "business", "goal")
 ALLOWED_STATUSES = frozenset((
-    "supports_rejection", "no_relevant_information", "contradicts", "uncertain"
+    "supports_rejection", "no_relevant_information", "context_only",
+    "contradicts", "uncertain"
 ))
 SPAM_TYPES = frozenset(("advertising", "fraud", "mass_template", "gibberish", "manipulation"))
 
@@ -193,6 +194,7 @@ def review_contract_failure(review: SemanticReview, answers: Sequence[str]) -> s
     This only validates *reported* facts, not the absence of facts AI missed.
     """
     from .scoring import _normalize_for_match  # import cycle safe
+    from .safety_rules import _verified_non_spam_context
     if len(answers) != 3 or any(not isinstance(a, str) for a in answers):
         return "invalid_answers"
     statuses = review.checks()
@@ -238,6 +240,17 @@ def review_contract_failure(review: SemanticReview, answers: Sequence[str]) -> s
             if (block.supporting_quotes or block.contradicting_quotes
                     or block.uncertainty_reason.strip()):
                 return "unreported_relevant_evidence"
+        elif status == "context_only":
+            # Only the spam pathway can treat substantive, independently
+            # checked location/profession facts as non-exculpatory context.
+            # It may NEVER be used to hide a contradiction in a core rejection.
+            if review.criterion != "spam":
+                return "context_only_not_allowed_for_core"
+            if (block.supporting_quotes or block.contradicting_quotes
+                    or block.uncertainty_reason.strip()):
+                return "inconsistent_context_evidence"
+            if not _verified_non_spam_context(field, answer):
+                return "unverified_context_only"
         elif status == "contradicts":
             if not block.contradicting_quotes or block.supporting_quotes:
                 return "inconsistent_contradiction_evidence"
