@@ -455,10 +455,8 @@ LLM-проверок **недостаточно** для автоматичес�
 пересчитывается без этого штрафа. Причина корректировки сохраняется в
 `raw_ai_json._gatekeeper_score_adjustment`.
 
-<<<<<<< HEAD
 При технических сбоях Telegram-отказа заявка остаётся `pending_admin`.
 Решения и сведения аудита сохраняются в `raw_ai_json` существующей БД.
-=======
 Статус `no_relevant_information` допускается лишь при
 `no_relevance_basis=explicit_neutral`, когда **сам исходный ответ** строго
 соответствует небольшому списку нейтральных формулировок в `app/decision.py`.
@@ -488,5 +486,3 @@ LIVE_TEST_CHAT_CONFIRMED=yes LIVE_TEST_CHAT_ID=-1001234567890 \
   BOT_TOKEN=... LLM_API_KEY=... LLM_BASE_URL=https://api.deepseek.com \
   LLM_MODEL=... python scripts/live_integration_smoke.py
 ```
-
->>>>>>> 375f7c3663c76903a5d08d8eb87a8e04fb954c2c
