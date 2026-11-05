@@ -529,29 +529,49 @@ class Database:
             return item
 
     async def store_admin_support_message(
-        self, ticket_id: int, text: str, admin_user_id: int, message_id: int
+        self, ticket_id: int, text: str, admin_user_id: int, message_id: int,
+        *, private_chat_id: int | None = None,
     ) -> SupportMessage | None:
+        """Deduplicate replies from groups and from different admin private chats.
+
+        Telegram message_id is unique only *inside* its chat. Existing group
+        replies retain the legacy index; DM replies use the existing composite
+        (private_chat_id, private_message_id) unique constraint, which also
+        guards against duplicate Telegram updates across restarts.
+        """
         async with self.sessions() as session:
-            exists = await session.scalar(
-                select(SupportMessage.id).where(
-                    SupportMessage.source_admin_message_id == message_id
+            if private_chat_id is None:
+                identity = (SupportMessage.source_admin_message_id == message_id)
+                fields = {"source_admin_message_id": message_id}
+            else:
+                if private_chat_id != admin_user_id:
+                    raise ValueError("Admin DM chat must match the actor's Telegram ID")
+                identity = and_(
+                    SupportMessage.source_private_chat_id == private_chat_id,
+                    SupportMessage.source_private_message_id == message_id,
                 )
-            )
-            if exists is not None:
+                fields = {
+                    "source_private_chat_id": private_chat_id,
+                    "source_private_message_id": message_id,
+                }
+            # Lock the ticket against concurrent closure, when supported.
+            active = await session.scalar(select(SupportTicket.id).where(
+                SupportTicket.id == ticket_id, SupportTicket.status == "open",
+            ).with_for_update())
+            if active is None:
+                return None
+            if await session.scalar(select(SupportMessage.id).where(identity)) is not None:
                 return None
             item = SupportMessage(
                 ticket_id=ticket_id, text=text, direction="admin_to_candidate",
-                admin_user_id=admin_user_id, source_admin_message_id=message_id,
+                admin_user_id=admin_user_id, **fields,
             )
             session.add(item)
             try:
                 await session.commit()
             except IntegrityError:
                 await session.rollback()
-                duplicate = await session.scalar(select(SupportMessage.id).where(
-                    SupportMessage.source_admin_message_id == message_id
-                ))
-                if duplicate is not None:
+                if await session.scalar(select(SupportMessage.id).where(identity)) is not None:
                     return None
                 raise
             await session.refresh(item)

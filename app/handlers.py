@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import logging
 import json
+import re
 import math
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
@@ -64,6 +65,14 @@ class GatekeeperHandlers:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         if update.effective_chat and update.effective_chat.type == ChatType.PRIVATE:
+            # The channel's "Ответить" button opens this deep link. Telegram
+            # sends /start sreply_N.
+            args = getattr(context, "args", None) or []
+            if len(args) == 1 and re.fullmatch(r"sreply_[1-9][0-9]*", args[0]):
+                await self.support.start_private_admin_reply(
+                    update, context, int(args[0].split("_", 1)[1])
+                )
+                return
             await update.effective_message.reply_text(
                 "Этот бот обрабатывает заявки на вступление в Solidus. "
                 "Подайте заявку через ссылку сообщества — бот автоматически начнёт анкету."
@@ -162,6 +171,11 @@ class GatekeeperHandlers:
             or update.effective_message is None
             or not update.effective_message.text
         ):
+            return
+
+        # A moderator replying to the bot's private support prompt must not
+        # accidentally create a candidate support ticket or answer an interview.
+        if await self.support.maybe_handle_private_admin_reply(update, context):
             return
 
         candidate = await self.db.get_active_interview(update.effective_user.id)

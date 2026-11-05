@@ -27,9 +27,17 @@ except ModuleNotFoundError:
         pass
 
     class InlineKeyboardButton:
-        def __init__(self, text: str, callback_data: str | None = None):
+        def __init__(self, text: str, callback_data: str | None = None,
+                     url: str | None = None):
             self.text = text
             self.callback_data = callback_data
+            self.url = url
+
+    class ForceReply:
+        def __init__(self, selective: bool = False,
+                     input_field_placeholder: str | None = None):
+            self.selective = selective
+            self.input_field_placeholder = input_field_placeholder
 
     class InlineKeyboardMarkup:
         def __init__(self, inline_keyboard):
@@ -52,6 +60,7 @@ except ModuleNotFoundError:
     telegram.Update = Update
     telegram.InlineKeyboardButton = InlineKeyboardButton
     telegram.InlineKeyboardMarkup = InlineKeyboardMarkup
+    telegram.ForceReply = ForceReply
     constants.ChatMemberStatus = ChatMemberStatus
     constants.ChatType = ChatType
     constants.ParseMode = ParseMode

@@ -17,12 +17,23 @@ def moderation_keyboard(candidate_id: int) -> InlineKeyboardMarkup:
 
 
 
-def support_close_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(
-            "✅ Закрыть обращение", callback_data=f"support:close:{ticket_id}"
-        )]]
-    )
+def support_close_keyboard(
+    ticket_id: int, *, bot_username: str | None = None,
+) -> InlineKeyboardMarkup:
+    """Keep close callback; optionally offer channel-safe DM reply deep link.
+
+    The deep link only selects a ticket. The DM handler ALWAYS checks the
+    administrator's permissions before showing details or accepting a reply.
+    """
+    buttons = []
+    if bot_username:
+        buttons.append(InlineKeyboardButton(
+            "✉️ Ответить", url=f"https://t.me/{bot_username}?start=sreply_{ticket_id}"
+        ))
+    buttons.append(InlineKeyboardButton(
+        "✅ Закрыть обращение", callback_data=f"support:close:{ticket_id}"
+    ))
+    return InlineKeyboardMarkup([buttons])
 
 
 def support_retry_keyboard(message_id: int) -> InlineKeyboardMarkup:

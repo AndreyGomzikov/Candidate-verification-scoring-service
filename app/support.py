@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
-from telegram import Update
+from telegram import ForceReply, Update
 from telegram.constants import ChatType
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
@@ -17,6 +17,11 @@ from .keyboards import support_close_keyboard, support_retry_keyboard
 from .models import Candidate, CandidateStatus
 
 logger = logging.getLogger(__name__)
+
+# The Telegram reply target itself carries the ticket ID: no in-memory state,
+# additional DB schema, or ambiguous "next message" conversation state.
+_PRIVATE_REPLY_PREFIX = "✉️ Ответ на обращение #"
+_PRIVATE_REPLY_RE = re.compile(r"^✉️ Ответ на обращение #([1-9][0-9]*)\n")
 
 STATUS_LABELS = {
     CandidateStatus.INTERVIEW.value: "Анкетирование",
@@ -41,6 +46,110 @@ class SupportHandlers:
         self.settings = settings
         self.db = db
         self.is_allowed_admin = is_allowed_admin
+        self._bot_username: str | None = None
+
+    async def _reply_bot_username(self, bot) -> str | None:
+        """Get actual bot username (works when BOT_TOKEN changes on a deployment)."""
+        if self._bot_username:
+            return self._bot_username
+        get_me = getattr(bot, "get_me", None)
+        if get_me is None:
+            # Minimal old test bot; production Telegram Bot always has get_me.
+            return None
+        me = await get_me()
+        name = getattr(me, "username", None)
+        if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_]{5,32}", name):
+            self._bot_username = name
+        return self._bot_username
+
+    async def start_private_admin_reply(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, ticket_id: int
+    ) -> None:
+        """Handle /start sreply_N, independently checking the actor's rights."""
+        msg = update.effective_message
+        if (
+            update.effective_chat is None
+            or update.effective_chat.type != ChatType.PRIVATE
+            or update.effective_user is None or msg is None
+        ):
+            return
+        if not await self.is_allowed_admin(context, update.effective_user.id):
+            await msg.reply_text("Недостаточно прав для ответа на обращения Solidus.")
+            return
+        ticket = await self.db.get_support_ticket(ticket_id)
+        if ticket is None or ticket.status != "open":
+            await msg.reply_text("Обращение закрыто или не найдено.")
+            return
+        # ForceReply instructs Telegram to attach reply_to_message to the next
+        # message, so the context survives restarts. We never expose the
+        # candidate's original text or Telegram ID in the deep-link response.
+        await msg.reply_text(
+            f"{_PRIVATE_REPLY_PREFIX}{ticket.id}\n"
+            "Напишите текст ответа одним сообщением. Ответьте именно на ЭТО "
+            "сообщение бота; отмена режима ответа не отправляет сообщение кандидату.",
+            reply_markup=ForceReply(
+                selective=False, input_field_placeholder="Ответ кандидату Solidus"
+            ),
+        )
+
+    async def maybe_handle_private_admin_reply(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> bool:
+        """Process only a reply to our genuine DM prompt; otherwise leave flow alone.
+
+        Returns True if this update belongs to the moderator-reply protocol.
+        The existing candidate interview and support routes are untouched.
+        """
+        chat = update.effective_chat
+        user = update.effective_user
+        msg = update.effective_message
+        if (
+            chat is None or chat.type != ChatType.PRIVATE or user is None
+            or msg is None or not isinstance(getattr(msg, "text", None), str)
+        ):
+            return False
+        original = getattr(msg, "reply_to_message", None)
+        if original is None or getattr(original, "from_user", None) is None:
+            return False
+        if original.from_user.id != context.bot.id:
+            return False
+        match = _PRIVATE_REPLY_RE.match(getattr(original, "text", "") or "")
+        if match is None:
+            return False
+        # Telegram-authored reply_to_message cannot be forged by typing a
+        # ticket number in plain text. An additional admin authorization and
+        # open-ticket check are still required for every single response.
+        if not await self.is_allowed_admin(context, user.id):
+            await msg.reply_text("Недостаточно прав для ответа на обращения Solidus.")
+            return True
+        ticket_id = int(match.group(1))
+        ticket = await self.db.get_support_ticket(ticket_id)
+        if ticket is None or ticket.status != "open":
+            await msg.reply_text("Обращение уже закрыто или не найдено.")
+            return True
+        answer = msg.text.strip()
+        if not answer:
+            await msg.reply_text("Напишите непустой ответ.")
+            return True
+        if len(answer) > self.settings.max_answer_length:
+            await msg.reply_text(texts.TOO_LONG)
+            return True
+        entry = await self.db.store_admin_support_message(
+            ticket.id, answer, user.id, msg.message_id,
+            private_chat_id=chat.id,
+        )
+        if entry is None:
+            # Duplicate Telegram update or ticket closed while handling it.
+            return True
+        delivered = await self._deliver_message(context.bot, entry.id)
+        if delivered:
+            await msg.reply_text(f"✅ Ответ по обращению #{ticket.id} доставлен кандидату.")
+        else:
+            await msg.reply_text(
+                "⚠️ Ответ сохранён. Доставка кандидату будет повторена "
+                "автоматически; повторно отправлять текст не нужно."
+            )
+        return True
 
     async def on_candidate_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -121,6 +230,7 @@ class SupportHandlers:
                 status = STATUS_LABELS.get(candidate.status, candidate.status)
                 # First two lines are immutable recovery markers; only bot-authored
                 # Telegram cards in ADMIN_CHAT_ID may be used to recover a mapping.
+                bot_username = await self._reply_bot_username(bot)
                 content = (
                     f"📩 Обращение #{ticket.id}\n"
                     f"🆔 Сообщение #{entry.id}\n"
@@ -129,12 +239,19 @@ class SupportHandlers:
                     f"Telegram ID: {candidate.user_id}\n"
                     f"Статус заявки: {status}\n\n"
                     f"Сообщение:\n{entry.text}\n\n"
-                    "Чтобы ответить кандидату, нажмите «Ответить» на ЭТО сообщение бота."
+                    + (
+                        "Для ответа кандидату нажмите кнопку «✉️ Ответить» ниже "
+                        "и отправьте сообщение в личном чате бота."
+                        if bot_username else
+                        "В группе модерации ответьте на ЭТО сообщение бота."
+                    )
                 )
                 sent = await bot.send_message(
                     chat_id=self.settings.admin_chat_id,
                     text=content,
-                    reply_markup=support_close_keyboard(ticket.id),
+                    reply_markup=support_close_keyboard(
+                        ticket.id, bot_username=bot_username,
+                    ),
                 )
                 success = await self.db.mark_support_delivery(
                     entry.id, attempt=entry.delivery_attempts,
