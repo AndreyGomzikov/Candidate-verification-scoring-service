@@ -15,6 +15,21 @@ jobs:
     name: Python tests and Docker build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # Disposable PostgreSQL for pre-merge integration checks.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gatekeeper_test
+          POSTGRES_PASSWORD: ci_local_only_password
+          POSTGRES_DB: gatekeeper_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gatekeeper_test -d gatekeeper_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,10 +45,23 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Python checks
+      - name: Python checks (SQLite + isolated PostgreSQL)
+        env:
+          GATEKEEPER_TEST_POSTGRES_URL: postgresql+asyncpg://gatekeeper_test:ci_local_only_password@127.0.0.1:5432/gatekeeper_ci
+          GATEKEEPER_ALLOW_DESTRUCTIVE_SCHEMA_TEST: 'yes'
         run: |
-          python -m compileall -q app
-          python -m pytest -q
+          python -m compileall -q app tests
+          # Never accept silently skipped DB integration tests in PR CI.
+          python -m pytest -q -ra --junitxml=pytest-results.xml
+          python - <<'PYTEST_RESULTS'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('pytest-results.xml').getroot()
+          suites = [root] if root.tag == 'testsuite' else list(root.findall('testsuite'))
+          skipped = sum(int(suite.attrib.get('skipped', 0)) for suite in suites)
+          if skipped:
+              raise SystemExit(f'CI cannot merge with {skipped} skipped tests')
+          print('All tests including SQLite/PostgreSQL integration executed')
+          PYTEST_RESULTS
 
       - name: Verify Docker image builds
         run: docker build --tag ai-gatekeeper:ci .

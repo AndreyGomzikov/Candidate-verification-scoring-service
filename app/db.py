@@ -2,16 +2,24 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
 from datetime import timedelta
 from collections import Counter
 from datetime import datetime, timezone
 
 from sqlalchemy import and_, exists, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from . import texts
-from .models import Base, Candidate, CandidateStatus, SupportMessage, SupportTicket
+from .models import (
+    Base, Candidate, CandidateStatus, CooldownDeclinedJoinRequest,
+    SupportMessage, SupportTicket,
+)
 from .scoring import ScoreResult
 
 
@@ -42,6 +50,48 @@ class Database:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             # create_all() does NOT add columns/indexes to existing databases.
+            # Preserve the actual Telegram request timestamp across retries/restarts.
+            # Existing rows are intentionally nullable: their request date is unknown.
+            if conn.dialect.name == "postgresql":
+                await conn.execute(text(
+                    "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS request_date "
+                    "TIMESTAMP WITH TIME ZONE"
+                ))
+            elif conn.dialect.name == "sqlite":
+                info = await conn.execute(text("PRAGMA table_info(candidates)"))
+                if "request_date" not in {row[1] for row in info.all()}:
+                    await conn.execute(text(
+                        "ALTER TABLE candidates ADD COLUMN request_date DATETIME"
+                    ))
+            # New states for the existing replay ledger. Backfill historical
+            # successful declines with status='declined' via the DEFAULT; do not
+            # rewrite, delete or silently confirm in-flight attempts.
+            if conn.dialect.name == "postgresql":
+                for name, definition in (
+                    ("status", "VARCHAR(16) NOT NULL DEFAULT 'declined'"),
+                    ("confirmed_at", "TIMESTAMP WITH TIME ZONE"),
+                    ("alerted_at", "TIMESTAMP WITH TIME ZONE"),
+                ):
+                    await conn.execute(text(
+                        f"ALTER TABLE cooldown_declined_join_requests "
+                        f"ADD COLUMN IF NOT EXISTS {name} {definition}"
+                    ))
+            elif conn.dialect.name == "sqlite":
+                info = await conn.execute(text(
+                    "PRAGMA table_info(cooldown_declined_join_requests)"
+                ))
+                existing = {row[1] for row in info.all()}
+                for name, definition in (
+                    ("status", "VARCHAR(16) NOT NULL DEFAULT 'declined'"),
+                    ("confirmed_at", "DATETIME"),
+                    ("alerted_at", "DATETIME"),
+                ):
+                    if name not in existing:
+                        await conn.execute(text(
+                            f"ALTER TABLE cooldown_declined_join_requests "
+                            f"ADD COLUMN {name} {definition}"
+                        ))
+
             # These idempotent, additive changes preserve all historical messages.
             if conn.dialect.name == "postgresql":
                 for name, definition in (
@@ -131,6 +181,216 @@ class Database:
                 ON support_tickets(user_id) WHERE status = 'open'
             """))
 
+    @asynccontextmanager
+    async def join_request_lock(
+        self, target_chat_id: int, user_id: int
+    ) -> AsyncIterator[None]:
+        """Serialize join-request actions across PostgreSQL bot instances.
+
+        Transaction-scoped advisory locks automatically release even if a bot
+        process crashes or its coroutine is cancelled. SQLite test databases
+        use the handler's in-process lock instead.
+        """
+        if self.engine.dialect.name != "postgresql":
+            yield
+            return
+        key = int.from_bytes(
+            hashlib.blake2b(
+                f"{target_chat_id}:{user_id}".encode("ascii"), digest_size=8
+            ).digest(),
+            "big",
+            signed=True,
+        )
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": key},
+            )
+            yield
+
+    async def last_cooldown_declined_request_date(
+        self, user_id: int, target_chat_id: int,
+    ) -> datetime | None:
+        """Latest attempted cooldown refusal, including pending/uncertain ones.
+
+        Every durable intent is a replay marker. Its name is kept for backward
+        compatibility with earlier deployments and test doubles.
+        """
+        async with self.sessions() as session:
+            request_date = await session.scalar(
+                select(func.max(CooldownDeclinedJoinRequest.request_date)).where(
+                    CooldownDeclinedJoinRequest.user_id == user_id,
+                    CooldownDeclinedJoinRequest.target_chat_id == target_chat_id,
+                )
+            )
+        # SQLite discards timezone info for DateTime(timezone=True). Telegram
+        # timestamps are UTC; return an aware value for both supported DBs.
+        if request_date is not None and request_date.tzinfo is None:
+            return request_date.replace(tzinfo=timezone.utc)
+        return request_date
+
+    async def begin_cooldown_decline(
+        self, user_id: int, target_chat_id: int, request_date: datetime,
+    ) -> bool:
+        """Commit the replay marker BEFORE Telegram is asked to decline.
+
+        Returns False when this exact event has already been recorded. The
+        unique constraint provides cross-process idempotency; the handler also
+        holds the per-applicant PostgreSQL advisory lock.
+        """
+        if request_date.tzinfo is None:
+            request_date = request_date.replace(tzinfo=timezone.utc)
+        dialect = self.engine.dialect.name
+        if dialect == "postgresql":
+            insert = pg_insert
+        elif dialect == "sqlite":
+            insert = sqlite_insert
+        else:
+            raise RuntimeError("Cooldown intent requires PostgreSQL or SQLite")
+        stmt = insert(CooldownDeclinedJoinRequest).values(
+            user_id=user_id, target_chat_id=target_chat_id,
+            request_date=request_date, status="pending",
+            declined_at=datetime.now(timezone.utc),
+        ).on_conflict_do_nothing(
+            index_elements=["target_chat_id", "user_id", "request_date"],
+        )
+        async with self.sessions() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount == 1
+
+    async def complete_cooldown_decline(
+        self, user_id: int, target_chat_id: int, request_date: datetime,
+        *, confirmed: bool,
+    ) -> bool:
+        """Mark Telegram success or ambiguity; never erase the replay marker.
+
+        A timeout/error may occur after Telegram already acted, so failure is
+        'uncertain', not 'declined' or a license to retry on a later update.
+        """
+        if request_date.tzinfo is None:
+            request_date = request_date.replace(tzinfo=timezone.utc)
+        changes = {"status": "declined" if confirmed else "uncertain"}
+        if confirmed:
+            changes["confirmed_at"] = datetime.now(timezone.utc)
+        async with self.sessions() as session:
+            result = await session.execute(
+                update(CooldownDeclinedJoinRequest).where(
+                    CooldownDeclinedJoinRequest.user_id == user_id,
+                    CooldownDeclinedJoinRequest.target_chat_id == target_chat_id,
+                    CooldownDeclinedJoinRequest.request_date == request_date,
+                    CooldownDeclinedJoinRequest.status == "pending",
+                ).values(**changes)
+            )
+            await session.commit()
+            return result.rowcount == 1
+
+    async def mark_stale_cooldown_intents(self, cutoff: datetime) -> int:
+        """Recover interrupted Telegram calls without automatically retrying.
+
+        Telegram does not expose a per-request ID or reliable pending state,
+        so retrying a decline after restart could affect a NEW join request.
+        Stale pending markers become uncertain, retained for manual review.
+        """
+        async with self.sessions() as session:
+            result = await session.execute(
+                update(CooldownDeclinedJoinRequest).where(
+                    CooldownDeclinedJoinRequest.status == "pending",
+                    CooldownDeclinedJoinRequest.declined_at < cutoff,
+                ).values(status="uncertain")
+            )
+            await session.commit()
+            return result.rowcount
+
+    async def list_unalerted_cooldown_intents(
+        self, *, limit: int = 20,
+    ) -> list[CooldownDeclinedJoinRequest]:
+        async with self.sessions() as session:
+            result = await session.scalars(
+                select(CooldownDeclinedJoinRequest).where(
+                    CooldownDeclinedJoinRequest.status == "uncertain",
+                    CooldownDeclinedJoinRequest.alerted_at.is_(None),
+                ).order_by(CooldownDeclinedJoinRequest.id).limit(limit)
+            )
+            return list(result.all())
+
+    async def mark_cooldown_intent_alerted(self, intent_id: int) -> bool:
+        """Record admin notification AFTER Telegram accepts the message."""
+        async with self.sessions() as session:
+            result = await session.execute(
+                update(CooldownDeclinedJoinRequest).where(
+                    CooldownDeclinedJoinRequest.id == intent_id,
+                    CooldownDeclinedJoinRequest.status == "uncertain",
+                    CooldownDeclinedJoinRequest.alerted_at.is_(None),
+                ).values(alerted_at=datetime.now(timezone.utc))
+            )
+            await session.commit()
+            return result.rowcount == 1
+
+    async def record_cooldown_declined_request(
+        self, user_id: int, target_chat_id: int, request_date: datetime,
+    ) -> None:
+        """Legacy/backfill helper for confirmed declines (not used by handler).
+
+        Production must use begin_cooldown_decline() BEFORE calling Telegram.
+        """
+        if request_date.tzinfo is None:
+            request_date = request_date.replace(tzinfo=timezone.utc)
+        dialect = self.engine.dialect.name
+        if dialect == "postgresql":
+            insert = pg_insert
+        elif dialect == "sqlite":
+            insert = sqlite_insert
+        else:
+            raise RuntimeError("Cooldown ledger requires PostgreSQL or SQLite")
+        stmt = insert(CooldownDeclinedJoinRequest).values(
+            user_id=user_id, target_chat_id=target_chat_id,
+            request_date=request_date,
+            declined_at=datetime.now(timezone.utc),
+        ).on_conflict_do_nothing(
+            index_elements=["target_chat_id", "user_id", "request_date"],
+        )
+        async with self.sessions() as session:
+            await session.execute(stmt)
+            await session.commit()
+
+    async def transition_status_if(
+        self,
+        candidate_id: int,
+        status: CandidateStatus,
+        *,
+        expected_status: CandidateStatus,
+        reason: str | None = None,
+        decided_by_user_id: int | None = None,
+        expected_stage: int | None = None,
+        older_than: datetime | None = None,
+    ) -> Candidate | None:
+        """Compare-and-swap a status; never overwrite a superseded application."""
+        clauses = [
+            Candidate.id == candidate_id,
+            Candidate.status == expected_status.value,
+        ]
+        if expected_stage is not None:
+            clauses.append(Candidate.stage == expected_stage)
+        if older_than is not None:
+            clauses.append(Candidate.updated_at < older_than)
+        values: dict = {
+            "status": status.value,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        if reason is not None:
+            values["decision_reason"] = reason
+        if decided_by_user_id is not None:
+            values["decided_by_user_id"] = decided_by_user_id
+        async with self.sessions() as session:
+            result = await session.execute(
+                update(Candidate).where(*clauses).values(**values)
+                .returning(Candidate.id)
+            )
+            updated_id = result.scalar_one_or_none()
+            await session.commit()
+            return await session.get(Candidate, updated_id) if updated_id is not None else None
+
     async def close(self) -> None:
         await self.engine.dispose()
 
@@ -142,6 +402,7 @@ class Database:
         target_chat_id: int,
         username: str | None,
         first_name: str | None,
+        request_date: datetime | None = None,
     ) -> Candidate:
         async with self.sessions() as session:
             await session.execute(
@@ -165,6 +426,7 @@ class Database:
                 target_chat_id=target_chat_id,
                 username=username,
                 first_name=first_name,
+                request_date=request_date,
                 status=CandidateStatus.INTERVIEW.value,
                 stage=1,
             )
@@ -299,6 +561,24 @@ class Database:
             )
             return await session.scalar(stmt)
 
+    async def get_latest_candidate_for_chat(
+        self, user_id: int, target_chat_id: int
+    ) -> Candidate | None:
+        """Last recorded join attempt, including terminal states.
+
+        Scoped to a chat: applicants may request access to several groups.
+        """
+        async with self.sessions() as session:
+            return await session.scalar(
+                select(Candidate)
+                .where(
+                    Candidate.user_id == user_id,
+                    Candidate.target_chat_id == target_chat_id,
+                )
+                .order_by(Candidate.id.desc())
+                .limit(1)
+            )
+
     async def get_recent_rejected_candidate(
         self, user_id: int, target_chat_id: int, cutoff: datetime
     ) -> Candidate | None:
@@ -316,6 +596,15 @@ class Database:
                         ]
                     ),
                     Candidate.updated_at >= cutoff,
+                    # HIDE_REQUESTER_MISSING means that there was no live
+                    # Telegram request left to decline. It is not a completed
+                    # rejection and must not trigger a reapplication cooldown.
+                    ~and_(
+                        Candidate.status == CandidateStatus.EXPIRED.value,
+                        func.coalesce(Candidate.decision_reason, "").ilike(
+                            "%hide_requester_missing%"
+                        ),
+                    ),
                 )
                 .order_by(Candidate.updated_at.desc())
                 .limit(1)
@@ -373,7 +662,13 @@ class Database:
         *,
         reason: str | None = None,
         decided_by_user_id: int | None = None,
-    ) -> Candidate:
+        expected_status: CandidateStatus | None = None,
+    ) -> Candidate | None:
+        if expected_status is not None:
+            return await self.transition_status_if(
+                candidate_id, status, expected_status=expected_status,
+                reason=reason, decided_by_user_id=decided_by_user_id,
+            )
         async with self.sessions() as session:
             candidate = await session.get(Candidate, candidate_id)
             if candidate is None:
@@ -389,25 +684,36 @@ class Database:
 
     async def save_score(
         self, candidate_id: int, score: ScoreResult, raw_ai_json: str
-    ) -> Candidate:
+    ) -> Candidate | None:
+        """Persist scoring only while this exact candidate is still scoring.
+
+        A single conditional SQL UPDATE prevents a late model response from
+        writing its output to a superseded candidate after a reapplication.
+        """
         async with self.sessions() as session:
-            candidate = await session.get(Candidate, candidate_id)
-            if candidate is None:
-                raise LookupError(candidate_id)
-            candidate.confidence_score = score.confidence_score
-            candidate.location_score = score.location_score
-            candidate.business_score = score.business_score
-            candidate.intent_score = score.intent_score
-            candidate.spam_score = score.spam_score
-            candidate.ai_confidence = score.ai_confidence
-            candidate.summary = score.summary
-            candidate.risk_flags_json = json.dumps(
-                score.risk_flags, ensure_ascii=False
+            result = await session.execute(
+                update(Candidate)
+                .where(
+                    Candidate.id == candidate_id,
+                    Candidate.status == CandidateStatus.SCORING.value,
+                )
+                .values(
+                    confidence_score=score.confidence_score,
+                    location_score=score.location_score,
+                    business_score=score.business_score,
+                    intent_score=score.intent_score,
+                    spam_score=score.spam_score,
+                    ai_confidence=score.ai_confidence,
+                    summary=score.summary,
+                    risk_flags_json=json.dumps(score.risk_flags, ensure_ascii=False),
+                    raw_ai_json=raw_ai_json,
+                    updated_at=datetime.now(timezone.utc),
+                )
+                .returning(Candidate.id)
             )
-            candidate.raw_ai_json = raw_ai_json
+            updated_id = result.scalar_one_or_none()
             await session.commit()
-            await session.refresh(candidate)
-            return candidate
+            return await session.get(Candidate, updated_id) if updated_id is not None else None
 
     async def count_by_status(self) -> dict[str, int]:
         async with self.sessions() as session:

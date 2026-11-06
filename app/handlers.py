@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import json
 import re
 import math
+from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
+from weakref import WeakValueDictionary
 from datetime import datetime, timedelta, timezone
 
 from telegram import Bot, Update
@@ -33,6 +36,40 @@ _TELEGRAM_TEXT_LIMIT = 4096
 _ADMIN_CARD_SAFE_LIMIT = 3900
 
 
+def _join_request_missing(exc: TelegramError) -> bool:
+    """Telegram no longer has a pending join request for this user/chat.
+
+    This is deliberately narrow: lack of permission, rate limits, and network
+    errors must NOT be mistaken for a withdrawn or processed request.
+    """
+    return "hide_requester_missing" in str(exc).casefold()
+
+
+def _newer_join_request(req: object, active: Candidate) -> bool:
+    """Only replace an active flow for a strictly newer Telegram request.
+
+    ChatJoinRequest.date is second-precision and stable across update retries;
+    candidate.created_at is NOT the request date and must not be compared.
+    Same-second withdraw/reapply cannot be distinguished reliably by Bot API:
+    fail closed and keep the current interview rather than silently replacing it.
+    Legacy rows without request_date cannot be distinguished either.
+    """
+    if active.status not in (
+        CandidateStatus.INTERVIEW.value, CandidateStatus.SCORING.value,
+        CandidateStatus.PENDING_ADMIN.value,
+    ):
+        return False
+    request_date = getattr(req, "date", None)
+    previous_date = getattr(active, "request_date", None)
+    if not isinstance(request_date, datetime) or not isinstance(previous_date, datetime):
+        return False
+    if request_date.tzinfo is None:
+        request_date = request_date.replace(tzinfo=timezone.utc)
+    if previous_date.tzinfo is None:
+        previous_date = previous_date.replace(tzinfo=timezone.utc)
+    return request_date > previous_date
+
+
 def _escape_clip(value: str, limit: int) -> str:
     """HTML-escape text while limiting the *escaped* output length."""
     if limit <= 0:
@@ -57,6 +94,9 @@ class GatekeeperHandlers:
         self.db = db
         self.scorer = scorer
         self._active_scoring_ids: set[int] = set()
+        # Serializes actions for one (community, Telegram user) in this bot.
+        # Weak references prevent retaining a lock for every past candidate.
+        self._join_locks: WeakValueDictionary[tuple[int, int], asyncio.Lock] = WeakValueDictionary()
         self.support = SupportHandlers(
             settings=settings, db=db, is_allowed_admin=self._is_allowed_admin
         )
@@ -78,19 +118,63 @@ class GatekeeperHandlers:
                 "Подайте заявку через ссылку сообщества — бот автоматически начнёт анкету."
             )
 
+    @asynccontextmanager
+    async def _request_lock(self, target_chat_id: int, user_id: int):
+        """Serialize Telegram side effects + DB updates per applicant.
+
+        PostgreSQL's advisory transaction lock also covers another bot worker.
+        Telegram itself has no per-attempt join-request ID, so user-initiated
+        withdrawal/reapplication outside the bot remains an API limitation.
+        """
+        key = (target_chat_id, user_id)
+        lock = self._join_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._join_locks[key] = lock
+        async with lock:
+            if isinstance(self.db, Database):
+                async with self.db.join_request_lock(target_chat_id, user_id):
+                    yield
+            else:
+                yield
+
     async def on_join_request(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         req = update.chat_join_request
         if req is None or req.chat.id != self.settings.target_chat_id:
             return
+        async with self._request_lock(req.chat.id, req.from_user.id):
+            await self._handle_join_request(req, context)
 
+    async def _handle_join_request(self, req, context) -> None:
         # Telegram may redeliver updates or a user may rapidly re-apply. Reuse an
         # already active flow instead of creating duplicate interviews/LLM calls.
         active = await self.db.get_active_candidate_for_chat(
             req.from_user.id, req.chat.id
         )
+        if active is not None and _newer_join_request(req, active):
+            logger.info(
+                "Fresh join request supersedes candidate=%s user=%s",
+                active.id, req.from_user.id,
+            )
+            # create_candidate() atomically marks the old active row superseded.
+            # An old moderator card cannot approve/reject the new request.
+            active = None
         if active is not None:
+            # Ignore an older Telegram update arriving after a newer request.
+            # In particular, never replace the current temporary DM address
+            # with a stale user_chat_id from a superseded attempt.
+            current_date = getattr(req, "date", None)
+            stored_date = getattr(active, "request_date", None)
+            if isinstance(current_date, datetime) and isinstance(stored_date, datetime):
+                if current_date.tzinfo is None:
+                    current_date = current_date.replace(tzinfo=timezone.utc)
+                if stored_date.tzinfo is None:
+                    stored_date = stored_date.replace(tzinfo=timezone.utc)
+                if current_date < stored_date:
+                    logger.info("Ignoring older join update for candidate=%s", active.id)
+                    return
             active = await self.db.set_user_chat_id(active.id, req.user_chat_id)
             if active.status == CandidateStatus.INTERVIEW.value:
                 await self._send_candidate_message(
@@ -102,6 +186,48 @@ class GatekeeperHandlers:
                 await self._send_candidate_message(context.bot, active, texts.PENDING_ADMIN)
             return
 
+        # A finished candidate is not "active", but Telegram may redeliver
+        # the *same* chat_join_request much later. Compare against the latest
+        # attempt for THIS chat before opening another interview or declining
+        # a purported reapplication during cooldown.
+        #
+        # Legacy rows may not have request_date: we cannot infer their Telegram
+        # request timestamp from created_at, so allow the new event in that case.
+        latest = await self.db.get_latest_candidate_for_chat(
+            req.from_user.id, req.chat.id
+        )
+        incoming_date = getattr(req, "date", None)
+        last_date = getattr(latest, "request_date", None)
+        if isinstance(last_date, datetime):
+            if not isinstance(incoming_date, datetime):
+                logger.info("Ignoring undated join update after candidate=%s", latest.id)
+                return
+            if incoming_date.tzinfo is None:
+                incoming_date = incoming_date.replace(tzinfo=timezone.utc)
+            if last_date.tzinfo is None:
+                last_date = last_date.replace(tzinfo=timezone.utc)
+            if incoming_date <= last_date:
+                logger.info("Ignoring replayed/older join update after candidate=%s", latest.id)
+                return
+
+        # Cooldown refusals are not Candidate rows. Without a persistent record
+        # of those events, an old declined update can resurrect an interview as
+        # soon as the cooldown expires. Keep a separate per-chat replay ledger.
+        last_cooldown_date = await self.db.last_cooldown_declined_request_date(
+            req.from_user.id, req.chat.id
+        )
+        if isinstance(last_cooldown_date, datetime):
+            if not isinstance(incoming_date, datetime):
+                logger.info("Ignoring undated event after cooldown decline user=%s", req.from_user.id)
+                return
+            if incoming_date.tzinfo is None:
+                incoming_date = incoming_date.replace(tzinfo=timezone.utc)
+            if last_cooldown_date.tzinfo is None:
+                last_cooldown_date = last_cooldown_date.replace(tzinfo=timezone.utc)
+            if incoming_date <= last_cooldown_date:
+                logger.info("Ignoring replayed cooldown-declined join user=%s", req.from_user.id)
+                return
+
         if self.settings.reapplication_cooldown_minutes > 0:
             cutoff = datetime.now(timezone.utc) - timedelta(
                 minutes=self.settings.reapplication_cooldown_minutes
@@ -110,16 +236,47 @@ class GatekeeperHandlers:
                 req.from_user.id, req.chat.id, cutoff
             )
             if recent is not None:
+                # This timestamp is mandatory for persistent replay protection.
+                # Telegram's actual ChatJoinRequest always supplies it; if an
+                # anomalous event lacks it, fail closed without a Telegram side
+                # effect, rather than creating an untraceable decline.
+                if not isinstance(incoming_date, datetime):
+                    logger.error(
+                        "Cannot safely decline undated cooldown join user=%s chat=%s",
+                        req.from_user.id, req.chat.id,
+                    )
+                    return
+                if incoming_date.tzinfo is None:
+                    incoming_date = incoming_date.replace(tzinfo=timezone.utc)
+                # FIRST commit the intent. If the process crashes at any later
+                # point, the marker blocks this event from reopening an
+                # interview, even after the cooldown expires.
+                started = await self.db.begin_cooldown_decline(
+                    req.from_user.id, req.chat.id, incoming_date,
+                )
+                if not started:
+                    logger.info("Ignoring duplicate cooldown intent user=%s", req.from_user.id)
+                    return
                 try:
                     await context.bot.decline_chat_join_request(
                         chat_id=req.chat.id, user_id=req.from_user.id
                     )
                 except TelegramError:
+                    # A timeout might mean Telegram did process the request.
+                    # Retain the event marker; never blindly retry this call.
+                    await self.db.complete_cooldown_decline(
+                        req.from_user.id, req.chat.id, incoming_date,
+                        confirmed=False,
+                    )
                     logger.exception(
-                        "Failed to decline cooldown re-application user=%s",
+                        "Uncertain cooldown decline; manual verification required user=%s",
                         req.from_user.id,
                     )
                     return
+                await self.db.complete_cooldown_decline(
+                    req.from_user.id, req.chat.id, incoming_date,
+                    confirmed=True,
+                )
                 # Use the fresh temporary chat id supplied by this join request.
                 try:
                     await context.bot.send_message(req.user_chat_id, texts.COOLDOWN)
@@ -135,6 +292,7 @@ class GatekeeperHandlers:
             target_chat_id=req.chat.id,
             username=req.from_user.username,
             first_name=req.from_user.first_name,
+            request_date=getattr(req, "date", None),
         )
 
         try:
@@ -178,11 +336,23 @@ class GatekeeperHandlers:
         if await self.support.maybe_handle_private_admin_reply(update, context):
             return
 
-        candidate = await self.db.get_active_interview(update.effective_user.id)
-        if candidate is None:
+        prelim = await self.db.get_active_interview(update.effective_user.id)
+        if prelim is None:
             await self.support.on_candidate_message(update, context)
             return
 
+        async with self._request_lock(prelim.target_chat_id, prelim.user_id):
+            # The expiry task or a new join request may have changed the row
+            # between our initial lookup and acquiring the lock.
+            current = await self.db.get_active_interview(update.effective_user.id)
+            if current is None or current.id != prelim.id:
+                return
+            to_score = await self._handle_private_interview_answer(update, current)
+        if to_score is not None:
+            # Never hold the applicant lock for two remote LLM calls.
+            await self._score_and_route(context.bot, to_score)
+
+    async def _handle_private_interview_answer(self, update, candidate: Candidate) -> Candidate | None:
         # After the candidate has replied, this is the authoritative private-chat
         # id for future notifications. Do not assume from_user.id == user_chat_id.
         if candidate.user_chat_id != update.effective_chat.id:
@@ -232,7 +402,7 @@ class GatekeeperHandlers:
                 "Candidate processing notification failed candidate=%s; scoring continues",
                 candidate.id,
             )
-        await self._score_and_route(context.bot, candidate)
+        return candidate
 
     async def _score_and_route(self, bot: Bot, candidate: Candidate) -> None:
         """Track live work so maintenance never recovers an in-flight LLM call."""
@@ -360,65 +530,92 @@ class GatekeeperHandlers:
             candidate = await self.db.save_score(
                 candidate.id, score, json.dumps(payload, ensure_ascii=False)
             )
+            if candidate is None:
+                logger.info("Scoring candidate superseded before decision; no Telegram action")
+                return
         except Exception as exc:
             logger.exception("AI scoring/routing failed for candidate=%s", candidate.id)
-            candidate = await self.db.set_status(
-                candidate.id, CandidateStatus.PENDING_ADMIN,
-                reason=f"AI scoring error: {type(exc).__name__}",
-            )
-            await self._send_admin_card(
-                bot, candidate, score=None,
-                scoring_error="AI-скоринг временно недоступен; требуется решение администратора.",
-            )
-            await self._send_candidate_message(bot, candidate, texts.PENDING_ADMIN)
-            return
-
-        # The bot must never decline solely based on the first score or
-        # independent AI verdict; only a deterministic positive gate is enough.
-        reason = decision.reason if decision.allow_auto_reject else None
-        if reason:
-            try:
-                await bot.decline_chat_join_request(
-                    chat_id=candidate.target_chat_id, user_id=candidate.user_id
-                )
-            except TelegramError as exc:
-                logger.exception("Failed to decline join request candidate=%s", candidate.id)
+            async with self._request_lock(candidate.target_chat_id, candidate.user_id):
+                current = await self.db.get_candidate(candidate.id)
+                if current is None or current.status != CandidateStatus.SCORING.value:
+                    return  # Candidate was replaced during remote AI work.
                 candidate = await self.db.set_status(
                     candidate.id, CandidateStatus.PENDING_ADMIN,
-                    reason=(f"Decision Gate разрешил автоотказ: {reason}. "
-                            f"Telegram decline failed: {type(exc).__name__}"),
+                    reason=f"AI scoring error: {type(exc).__name__}",
+                    expected_status=CandidateStatus.SCORING,
                 )
+                if candidate is None:
+                    return
+                await self._send_admin_card(
+                    bot, candidate, score=None,
+                    scoring_error="AI-скоринг временно недоступен; требуется решение администратора.",
+                )
+                await self._send_candidate_message(bot, candidate, texts.PENDING_ADMIN)
+                return
+
+        # Another join event may have superseded this application while the
+        # model was working. Protect the final Telegram operation and DB write.
+        async with self._request_lock(candidate.target_chat_id, candidate.user_id):
+            current = await self.db.get_candidate(candidate.id)
+            if current is None or current.status != CandidateStatus.SCORING.value:
+                logger.info("Skipping obsolete scored candidate=%s", candidate.id)
+                return
+            # The bot must never decline solely based on the first score or
+            # independent AI verdict; only a deterministic positive gate is enough.
+            reason = decision.reason if decision.allow_auto_reject else None
+            if reason:
+                try:
+                    await bot.decline_chat_join_request(
+                        chat_id=candidate.target_chat_id, user_id=candidate.user_id
+                    )
+                except TelegramError as exc:
+                    logger.exception("Failed to decline join request candidate=%s", candidate.id)
+                    candidate = await self.db.set_status(
+                        candidate.id, CandidateStatus.PENDING_ADMIN,
+                        reason=(f"Decision Gate разрешил автоотказ: {reason}. "
+                                f"Telegram decline failed: {type(exc).__name__}"),
+                        expected_status=CandidateStatus.SCORING,
+                    )
+                    if candidate is None:
+                        return
+                    await self._send_admin_card(
+                        bot, candidate, score=score,
+                        status_note=("⚠️ Decision Gate разрешил автоотказ, но Telegram "
+                                     "не подтвердил отклонение. Решает администратор."),
+                        with_buttons=True,
+                    )
+                    await self._send_candidate_message(bot, candidate, texts.TECHNICAL_REVIEW)
+                    return
+                candidate = await self.db.set_status(
+                    candidate.id, CandidateStatus.AUTO_REJECTED, reason=reason,
+                    expected_status=CandidateStatus.SCORING,
+                )
+                if candidate is None:
+                    logger.error("Telegram declined but DB status changed candidate=%s", current.id)
+                    return
+                logger.info("Telegram auto-decline completed candidate=%s gate=%s",
+                            candidate.id, decision.code)
+                await self._send_candidate_message(bot, candidate, texts.REJECTED)
                 await self._send_admin_card(
                     bot, candidate, score=score,
-                    status_note=("⚠️ Decision Gate разрешил автоотказ, но Telegram "
-                                 "не подтвердил отклонение. Решает администратор."),
-                    with_buttons=True,
+                    status_note="🤖 Заявка автоматически отклонена: " + reason,
+                    with_buttons=False,
                 )
-                await self._send_candidate_message(bot, candidate, texts.TECHNICAL_REVIEW)
                 return
-            candidate = await self.db.set_status(
-                candidate.id, CandidateStatus.AUTO_REJECTED, reason=reason
-            )
-            logger.info("Telegram auto-decline completed candidate=%s gate=%s",
-                        candidate.id, decision.code)
-            await self._send_candidate_message(bot, candidate, texts.REJECTED)
-            await self._send_admin_card(
-                bot, candidate, score=score,
-                status_note="🤖 Заявка автоматически отклонена: " + reason,
-                with_buttons=False,
-            )
-            return
 
-        candidate = await self.db.set_status(
-            candidate.id, CandidateStatus.PENDING_ADMIN
-        )
-        status_note = (
-            "🔎 Предложенный автоотказ не прошёл независимый контроль "
-            f"({decision.code}). Требуется решение администратора."
-            if proposal is not None else None
-        )
-        await self._send_admin_card(bot, candidate, score=score, status_note=status_note)
-        await self._send_candidate_message(bot, candidate, texts.PENDING_ADMIN)
+            candidate = await self.db.set_status(
+                candidate.id, CandidateStatus.PENDING_ADMIN,
+                expected_status=CandidateStatus.SCORING,
+            )
+            if candidate is None:
+                return
+            status_note = (
+                "🔎 Предложенный автоотказ не прошёл независимый контроль "
+                f"({decision.code}). Требуется решение администратора."
+                if proposal is not None else None
+            )
+            await self._send_admin_card(bot, candidate, score=score, status_note=status_note)
+            await self._send_candidate_message(bot, candidate, texts.PENDING_ADMIN)
 
     async def _is_allowed_admin(
         self, context: ContextTypes.DEFAULT_TYPE, user_id: int
@@ -460,75 +657,123 @@ class GatekeeperHandlers:
         if candidate is None:
             await query.answer("Кандидат не найден", show_alert=True)
             return
-        if candidate.status != CandidateStatus.PENDING_ADMIN.value:
-            await query.answer("По этой заявке решение уже принято", show_alert=True)
-            return
-
-        try:
-            if action == "approve":
-                await context.bot.approve_chat_join_request(
-                    chat_id=candidate.target_chat_id, user_id=candidate.user_id
-                )
-                candidate = await self.db.set_status(
-                    candidate.id,
-                    CandidateStatus.APPROVED,
-                    reason="Одобрено администратором",
-                    decided_by_user_id=update.effective_user.id,
-                )
-                await self._send_candidate_message(
-                    context.bot, candidate, texts.APPROVED
-                )
-                verdict = (
-                    "✅ Одобрено администратором "
-                    + html.escape(update.effective_user.full_name)
-                )
-            elif action == "reject":
-                await context.bot.decline_chat_join_request(
-                    chat_id=candidate.target_chat_id, user_id=candidate.user_id
-                )
-                candidate = await self.db.set_status(
-                    candidate.id,
-                    CandidateStatus.REJECTED,
-                    reason="Отклонено администратором",
-                    decided_by_user_id=update.effective_user.id,
-                )
-                await self._send_candidate_message(
-                    context.bot, candidate, texts.REJECTED
-                )
-                verdict = (
-                    "❌ Отклонено администратором "
-                    + html.escape(update.effective_user.full_name)
-                )
-            else:
-                await query.answer("Неизвестное действие", show_alert=True)
+        async with self._request_lock(candidate.target_chat_id, candidate.user_id):
+            candidate = await self.db.get_candidate(candidate_id)
+            if candidate is None:
+                await query.answer("Кандидат не найден", show_alert=True)
                 return
-        except TelegramError as exc:
-            # Do not mutate DB status when Telegram did not confirm the action.
-            logger.exception(
-                "Admin decision Telegram API failed candidate=%s action=%s",
-                candidate.id,
-                action,
-            )
-            await query.answer(
-                "Telegram не выполнил действие. Заявка могла быть отозвана; "
-                "состояние в БД не изменено.",
-                show_alert=True,
-            )
-            await self._send_admin_audit(
-                context.bot,
-                candidate,
-                f"⚠️ Не удалось выполнить {action}: {type(exc).__name__}. "
-                "Карточка оставлена без изменений.",
-            )
-            return
+            if candidate.status != CandidateStatus.PENDING_ADMIN.value:
+                await query.answer("По этой заявке решение уже принято", show_alert=True)
+                return
 
-        await query.answer("Готово")
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(
-            self.settings.admin_chat_id,
-            verdict,
-            parse_mode=ParseMode.HTML,
-        )
+            try:
+                if action == "approve":
+                    await context.bot.approve_chat_join_request(
+                        chat_id=candidate.target_chat_id, user_id=candidate.user_id
+                    )
+                    candidate = await self.db.transition_status_if(
+                        candidate.id,
+                        CandidateStatus.APPROVED,
+                        expected_status=CandidateStatus.PENDING_ADMIN,
+                        reason="Одобрено администратором",
+                        decided_by_user_id=update.effective_user.id,
+                    )
+                    if candidate is None:
+                        logger.error("Approved Telegram but candidate status changed id=%s", candidate_id)
+                        await query.answer("Состояние заявки изменилось, проверьте журнал", show_alert=True)
+                        return
+                    await self._send_candidate_message(
+                        context.bot, candidate, texts.APPROVED
+                    )
+                    verdict = (
+                        "✅ Одобрено администратором "
+                        + html.escape(update.effective_user.full_name)
+                    )
+                elif action == "reject":
+                    await context.bot.decline_chat_join_request(
+                        chat_id=candidate.target_chat_id, user_id=candidate.user_id
+                    )
+                    candidate = await self.db.transition_status_if(
+                        candidate.id,
+                        CandidateStatus.REJECTED,
+                        expected_status=CandidateStatus.PENDING_ADMIN,
+                        reason="Отклонено администратором",
+                        decided_by_user_id=update.effective_user.id,
+                    )
+                    if candidate is None:
+                        logger.error("Declined Telegram but candidate status changed id=%s", candidate_id)
+                        await query.answer("Состояние заявки изменилось, проверьте журнал", show_alert=True)
+                        return
+                    await self._send_candidate_message(
+                        context.bot, candidate, texts.REJECTED
+                    )
+                    verdict = (
+                        "❌ Отклонено администратором "
+                        + html.escape(update.effective_user.full_name)
+                    )
+                else:
+                    await query.answer("Неизвестное действие", show_alert=True)
+                    return
+            except TelegramError as exc:
+                if _join_request_missing(exc):
+                    # No live join request exists. Do not record an approval or
+                    # rejection, and do not leave dead moderator buttons enabled.
+                    await self.db.transition_status_if(
+                        candidate.id,
+                        CandidateStatus.REQUEST_MISSING,
+                        expected_status=CandidateStatus.PENDING_ADMIN,
+                        reason=(
+                            "Telegram join request absent or already processed "
+                            "(Hide_requester_missing); admin action not performed"
+                        ),
+                    )
+                    try:
+                        await query.answer(
+                            "Заявка отсутствует в Telegram или уже обработана. "
+                            "Карточка закрыта без одобрения или отказа.",
+                            show_alert=True,
+                        )
+                    except TelegramError:
+                        # An old callback may have expired; still try to remove
+                        # obsolete buttons from the moderator card.
+                        logger.warning(
+                            "Could not answer stale moderator callback candidate=%s",
+                            candidate.id,
+                        )
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except TelegramError:
+                        logger.warning(
+                            "Could not remove stale moderator buttons candidate=%s",
+                            candidate.id,
+                        )
+                    return
+                # Unknown Telegram failure: never claim that an action succeeded.
+                logger.exception(
+                    "Admin decision Telegram API failed candidate=%s action=%s",
+                    candidate.id,
+                    action,
+                )
+                await query.answer(
+                    "Telegram не выполнил действие. Заявка могла быть отозвана; "
+                    "состояние в БД не изменено.",
+                    show_alert=True,
+                )
+                await self._send_admin_audit(
+                    context.bot,
+                    candidate,
+                    f"⚠️ Не удалось выполнить {action}: {type(exc).__name__}. "
+                    "Карточка оставлена без изменений.",
+                )
+                return
+
+            await query.answer("Готово")
+            await query.edit_message_reply_markup(reply_markup=None)
+            await context.bot.send_message(
+                self.settings.admin_chat_id,
+                verdict,
+                parse_mode=ParseMode.HTML,
+            )
 
     async def on_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -551,6 +796,7 @@ class GatekeeperHandlers:
             "auto_rejected": "Отклонено автоматически",
             "expired": "Срок анкеты истёк",
             "superseded": "Заменено новой заявкой",
+            "request_missing": "Заявка отсутствует в Telegram или уже обработана",
             "error": "Ошибка обработки",
         }
         counts = await self.db.count_by_status()
@@ -615,45 +861,115 @@ class GatekeeperHandlers:
                 await self._send_candidate_message(bot, item, texts.PENDING_ADMIN)
         return count
 
+    async def recover_cooldown_decline_intents(self, bot: Bot) -> int:
+        """Notify admins of ambiguous/crashed cooldown declines.
+
+        We intentionally do not retry the Telegram side effect: without a
+        per-attempt Telegram identifier it might decline a newer application.
+        Replay markers survive until an operator reviews the situation.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+        changed = await self.db.mark_stale_cooldown_intents(cutoff)
+        if changed:
+            logger.warning("Recovered %s stale cooldown intents as uncertain", changed)
+        notices = await self.db.list_unalerted_cooldown_intents()
+        for item in notices:
+            text = (
+                "⚠️ Неопределённый результат отклонения заявки в cooldown.\n"
+                f"Чат: {item.target_chat_id}, пользователь: {item.user_id}, "
+                f"дата заявки (UTC): {item.request_date}.\n"
+                "Бот НЕ повторяет отклонение автоматически: Telegram не "
+                "предоставляет ID отдельной заявки. Проверьте вручную "
+                "текущую заявку пользователя и действия бота."
+            )
+            try:
+                await bot.send_message(chat_id=self.settings.admin_chat_id, text=text)
+            except TelegramError:
+                logger.exception("Failed to alert admin about cooldown intent=%s", item.id)
+                # Leave marker unalerted; maintenance can try again.
+                continue
+            await self.db.mark_cooldown_intent_alerted(item.id)
+        return changed
+
     async def expire_stale_interviews(self, bot: Bot) -> int:
-        """Close abandoned questionnaires so pending join requests do not hang forever."""
+        """Close stale questionnaires without acting on a superseded DB row.
+
+        Both the re-check and Telegram decline are protected by the same
+        per-user lock used by new join events and moderator decisions.
+        The database CAS prevents replacing a status changed by another worker.
+        """
         cutoff = datetime.now(timezone.utc) - timedelta(
             minutes=self.settings.interview_timeout_minutes
         )
         candidates = await self.db.list_expired_interviews(cutoff)
         processed = 0
-        for candidate in candidates:
-            try:
-                await bot.decline_chat_join_request(
-                    chat_id=candidate.target_chat_id, user_id=candidate.user_id
+        for item in candidates:
+            async with self._request_lock(item.target_chat_id, item.user_id):
+                candidate = await self.db.get_candidate(item.id)
+                if candidate is None or candidate.status != CandidateStatus.INTERVIEW.value:
+                    continue
+                updated_at = candidate.updated_at
+                if updated_at is None:
+                    continue
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=timezone.utc)
+                if candidate.stage > 3 or updated_at >= cutoff:
+                    continue
+                active = await self.db.get_active_candidate_for_chat(
+                    candidate.user_id, candidate.target_chat_id
                 )
-            except TelegramError as exc:
-                logger.exception(
-                    "Failed to expire stale interview candidate=%s", candidate.id
-                )
-                candidate = await self.db.set_status(
-                    candidate.id,
-                    CandidateStatus.PENDING_ADMIN,
-                    reason=f"Interview timeout, Telegram decline failed: {type(exc).__name__}",
-                )
-                await self._send_admin_card(
-                    bot,
-                    candidate,
-                    score=None,
-                    scoring_error=(
-                        "Анкета просрочена, но Telegram не подтвердил автоматическое "
-                        "отклонение. Требуется решение администратора."
-                    ),
-                )
-                continue
+                if active is None or active.id != candidate.id:
+                    logger.info("Skipping superseded expiry candidate=%s", item.id)
+                    continue
+                try:
+                    await bot.decline_chat_join_request(
+                        chat_id=candidate.target_chat_id, user_id=candidate.user_id
+                    )
+                except TelegramError as exc:
+                    if _join_request_missing(exc):
+                        logger.info("Expired candidate=%s: Hide_requester_missing", candidate.id)
+                        updated = await self.db.transition_status_if(
+                            candidate.id, CandidateStatus.EXPIRED,
+                            expected_status=CandidateStatus.INTERVIEW,
+                            expected_stage=candidate.stage, older_than=cutoff,
+                            reason=(
+                                "Анкета просрочена; Telegram-заявка отсутствует или "
+                                "уже обработана (Hide_requester_missing). "
+                                "Отклонение не выполнялось."
+                            ),
+                        )
+                        if updated is not None:
+                            processed += 1
+                        continue
+                    logger.exception("Failed to expire stale interview candidate=%s", candidate.id)
+                    updated = await self.db.transition_status_if(
+                        candidate.id, CandidateStatus.PENDING_ADMIN,
+                        expected_status=CandidateStatus.INTERVIEW,
+                        expected_stage=candidate.stage, older_than=cutoff,
+                        reason=(
+                            "Interview timeout, Telegram decline failed: "
+                            f"{type(exc).__name__}"
+                        ),
+                    )
+                    if updated is not None:
+                        await self._send_admin_card(
+                            bot, updated, score=None,
+                            scoring_error=(
+                                "Анкета просрочена, но Telegram не подтвердил "
+                                "автоматическое отклонение. Требуется решение администратора."
+                            ),
+                        )
+                    continue
 
-            candidate = await self.db.set_status(
-                candidate.id,
-                CandidateStatus.EXPIRED,
-                reason="Анкета не завершена до истечения таймаута",
-            )
-            await self._send_candidate_message(bot, candidate, texts.TIMEOUT)
-            processed += 1
+                updated = await self.db.transition_status_if(
+                    candidate.id, CandidateStatus.EXPIRED,
+                    expected_status=CandidateStatus.INTERVIEW,
+                    expected_stage=candidate.stage, older_than=cutoff,
+                    reason="Анкета не завершена до истечения таймаута",
+                )
+                if updated is not None:
+                    await self._send_candidate_message(bot, updated, texts.TIMEOUT)
+                    processed += 1
         return processed
 
     async def _send_candidate_message(

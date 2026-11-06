@@ -47,6 +47,7 @@ def main() -> None:
         while True:
             try:
                 await handlers.recover_stale_scoring(application.bot)
+                await handlers.recover_cooldown_decline_intents(application.bot)
                 await handlers.expire_stale_interviews(application.bot)
                 await handlers.support.retry_due_messages(application.bot)
             except asyncio.CancelledError:
@@ -60,6 +61,7 @@ def main() -> None:
         await db.init()
         # The old process is gone. Recover interrupted LLM work before polling.
         await handlers.recover_stale_scoring(application.bot, startup=True)
+        await handlers.recover_cooldown_decline_intents(application.bot)
         me = await application.bot.get_me()
         logger.info("Solidus AI Gatekeeper started as @%s", me.username)
         maintenance_task = asyncio.create_task(

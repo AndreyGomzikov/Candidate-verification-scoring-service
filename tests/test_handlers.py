@@ -78,6 +78,9 @@ class RoutingDB:
     async def save_score(self, candidate_id, score_result, raw):
         return self.item
 
+    async def get_candidate(self, candidate_id):
+        return self.item
+
     async def set_status(self, candidate_id, status, **kwargs):
         self.statuses.append(status)
         self.item.status = status.value
@@ -197,6 +200,12 @@ def test_initial_dm_failure_is_not_automatic_decline():
         async def get_active_candidate_for_chat(self, *args):
             return None
 
+        async def get_latest_candidate_for_chat(self, *args):
+            return None
+
+        async def last_cooldown_declined_request_date(self, *args):
+            return None
+
         async def get_recent_rejected_candidate(self, *args):
             return None
 
@@ -246,7 +255,7 @@ def test_approval_notifies_candidate_with_exact_link():
     item = candidate(status=CandidateStatus.PENDING_ADMIN.value, stage=4)
     db = SimpleNamespace(
         get_candidate=AsyncMock(return_value=item),
-        set_status=AsyncMock(return_value=item),
+        transition_status_if=AsyncMock(return_value=item),
     )
     bot = SimpleNamespace(
         approve_chat_join_request=AsyncMock(),
@@ -274,4 +283,4 @@ def test_approval_notifies_candidate_with_exact_link():
         call.args == (item.user_chat_id, texts.APPROVED)
         for call in bot.send_message.await_args_list
     )
-    db.set_status.assert_awaited_once()
+    db.transition_status_if.assert_awaited_once()

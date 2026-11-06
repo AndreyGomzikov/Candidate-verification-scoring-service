@@ -20,6 +20,7 @@ class CandidateStatus(StrEnum):
     AUTO_REJECTED = "auto_rejected"
     EXPIRED = "expired"
     SUPERSEDED = "superseded"
+    REQUEST_MISSING = "request_missing"
     ERROR = "error"
 
 
@@ -32,6 +33,9 @@ class Candidate(Base):
     target_chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Telegram ChatJoinRequest.date (second precision). NULL for historical rows.
+    request_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     status: Mapped[str] = mapped_column(
         String(32), default=CandidateStatus.INTERVIEW.value, index=True
@@ -62,6 +66,40 @@ class Candidate(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+class CooldownDeclinedJoinRequest(Base):
+    """Telegram attempts declined during cooldown, retained for replay protection.
+
+    Keep these outside candidates: a cooldown refusal must not open an interview,
+    extend the cooldown, or alter candidate decision/statistics.
+    """
+
+    __tablename__ = "cooldown_declined_join_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "target_chat_id", "user_id", "request_date",
+            name="uq_cooldown_declined_join_request",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    target_chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    request_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Historical rows represent successful declines. New requests are first
+    # persisted as pending BEFORE the external Telegram call; pending/uncertain
+    # rows must remain replay markers even if the bot crashes.
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="declined", server_default="declined",
+    )
+    # Legacy column name retained for schema compatibility. For new records
+    # this is the intent creation time, not proof Telegram declined the request.
+    declined_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
+    )
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SupportTicket(Base):

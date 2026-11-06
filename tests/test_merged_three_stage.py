@@ -108,6 +108,9 @@ class FakeDB:
         self.raw = None
         self.statuses = []
 
+    async def get_candidate(self, candidate_id):
+        return self.candidate
+
     async def save_score(self, ident, result, raw):
         assert ident == self.candidate.id
         self.saved = result

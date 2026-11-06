@@ -243,6 +243,9 @@ def test_false_low_location_routes_to_moderator_without_decline():
     class FakeDB:
         stored = None
         statuses = []
+        async def get_candidate(self, candidate_id):
+            return item
+
         async def save_score(self, candidate_id, score, raw):
             self.stored = score
             assert json.loads(raw)["_gatekeeper_score_adjustment"]["version"] == 1

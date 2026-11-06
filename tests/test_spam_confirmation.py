@@ -238,6 +238,9 @@ def test_reviewer_network_failure_routes_to_moderator():
     class DB:
         statuses = []
         saved_score = None
+        async def get_candidate(self, candidate_id):
+            return candidate
+
         async def save_score(self, ident, score, raw):
             self.saved_score = score
             audit = json.loads(raw)["_gatekeeper_decision"]
