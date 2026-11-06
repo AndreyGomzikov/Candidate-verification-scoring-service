@@ -1034,9 +1034,12 @@ class GatekeeperHandlers:
                             f"<b>Confidence Score:</b> {score.confidence_score}/100"
                         ),
                         (
-                            "Локация: "
-                            f"{score.location_score}/100 · Бизнес: {score.business_score}/100 · "
-                            f"Цель: {score.intent_score}/100 · Спам-риск: {score.spam_score}/100"
+                            f"Локация: {score.location_score}/100 · "
+                            f"Бизнес: {score.business_score}/100"
+                        ),
+                        (
+                            f"Цель: {score.intent_score}/100 · "
+                            f"Спам-риск: {score.spam_score}/100"
                         ),
                         f"Уверенность оценки: {score.ai_confidence}/100",
                         "",
@@ -1046,12 +1049,14 @@ class GatekeeperHandlers:
                 )
                 if score.spam_penalty_withheld:
                     lines.extend([
+                        "",
                         f"<b>Исходный Score со спам-штрафом:</b> "
                         f"{score.preliminary_confidence_score}/100",
                         "⚠️ Высокий спам-риск модели не подтверждён для автоотказа. "
                         "Оценка без штрафа предварительная; требуется решение модератора.",
                     ])
                 if score.core_verifications:
+                    lines.append("")
                     for review in score.core_verifications:
                         name = "Локация" if review.field == "location" else "Бизнес"
                         label = ("подтверждено" if review.permits_auto_reject
@@ -1064,37 +1069,37 @@ class GatekeeperHandlers:
                     score.location_score <= getattr(self.settings, "auto_reject_core_score_max", 15)
                     or score.business_score <= getattr(self.settings, "auto_reject_core_score_max", 15)
                 ):
-                    lines.append("⚠️ Критически низкий балл: нет подтверждения для автоотказа")
+                    lines.extend(["", "⚠️ Критически низкий балл: нет подтверждения для автоотказа"])
+
+                # Render confidence sections in a fixed order, instead of inserting
+                # a line relative to the list tail (which changes with optional blocks).
+                if score.confidence_details is not None:
+                    details = score.confidence_details
+                    lines.extend([
+                        "",
+                        "<b>Основания уверенности</b>",
+                        f"Полнота: {details.completeness} · Цитаты: {details.specificity}",
+                        f"Согласованность: {details.consistency} · "
+                        f"Определённость: {details.certainty}",
+                    ])
+                    # A weak global rubric does not prohibit assessment of a
+                    # specific, independently verified ground.
+                    if details.notes and not any(
+                        grade.evidence_verified for grade in score.decision_confidences
+                    ):
+                        lines.append("⚠️ " + _escape_clip(details.notes[-1], 140))
+
                 if score.decision_confidences:
                     names = {"location": "локации", "business": "бизнесу",
                              "spam": "спаму"}
                     for grade in score.decision_confidences[:3]:
-                        lines.append(
-                            f"<b>Уверенность по {names.get(grade.criterion, grade.criterion)}:</b> "
-                            f"{grade.score}/100 · "
-                            f"полнота {grade.completeness} · цитата {grade.specificity} · "
-                            f"согласованность {grade.consistency} · "
-                            f"определённость {grade.certainty}"
-                        )
-                if score.confidence_details is not None:
-                    details = score.confidence_details
-                    lines.insert(
-                        -3,
-                        "<b>Основания уверенности:</b> "
-                        f"полнота {details.completeness} · "
-                        f"цитаты {details.specificity} · "
-                        f"согласованность {details.consistency} · "
-                        f"определённость {details.certainty}",
-                    )
-                    # The global rubric can be incomplete while a specific
-                    # reason has grounded evidence. Do not mislabel this as
-                    # a ban on stage-3 assessment of the specific ground.
-                    if details.notes and not any(
-                        grade.evidence_verified for grade in score.decision_confidences
-                    ):
                         lines.extend([
                             "",
-                            "⚠️ " + _escape_clip(details.notes[-1], 140),
+                            f"<b>Уверенность по {names.get(grade.criterion, grade.criterion)}:</b> "
+                            f"{grade.score}/100",
+                            f"Полнота: {grade.completeness} · Цитата: {grade.specificity}",
+                            f"Согласованность: {grade.consistency} · "
+                            f"Определённость: {grade.certainty}",
                         ])
                 if score.spam_score >= getattr(self.settings, "auto_reject_spam_score", 85):
                     verdict = score.spam_verification
@@ -1150,6 +1155,7 @@ class GatekeeperHandlers:
                     f"Спам-риск: {score.spam_score}/100 · Уверенность оценки: {score.ai_confidence}/100",
                     *([f"Исходный Score: {score.preliminary_confidence_score}/100"]
                       if score.spam_penalty_withheld else []),
+                    "",
                     "<b>AI-саммари</b>",
                     _escape_clip(score.summary, 180),
                 ]
