@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from . import texts
 from .models import (
-    Base, Candidate, CandidateStatus, CooldownDeclinedJoinRequest,
+    Base, Candidate, CandidateStatus, CooldownDeclinedJoinRequest, JoinRequestEvent,
     SupportMessage, SupportTicket,
 )
 from .scoring import ScoreResult
@@ -714,6 +714,159 @@ class Database:
             updated_id = result.scalar_one_or_none()
             await session.commit()
             return await session.get(Candidate, updated_id) if updated_id is not None else None
+
+    # Join-request evidence is persisted before Telegram side effects. A separate
+    # record is necessary because candidates are not created for ignored events
+    # and because an interrupted request can fail before candidate insertion.
+    async def record_join_request_event(
+        self, *, update_id: int, target_chat_id: int, user_id: int,
+        request_date: datetime | None,
+    ) -> None:
+        values = dict(
+            update_id=update_id, target_chat_id=target_chat_id, user_id=user_id,
+            request_date=request_date, status="received",
+        )
+        async with self.sessions() as session:
+            if self.engine.dialect.name == "postgresql":
+                statement = pg_insert(JoinRequestEvent).values(**values)
+            else:
+                statement = sqlite_insert(JoinRequestEvent).values(**values)
+            await session.execute(statement.on_conflict_do_nothing(index_elements=["update_id"]))
+            await session.commit()
+
+    async def update_join_request_event(
+        self, update_id: int, status: str, *,
+        candidate_id: int | None = None, first_message_id: int | None = None,
+        error_type: str | None = None, alert_required: bool = False,
+    ) -> None:
+        values = {"status": status, "updated_at": datetime.now(timezone.utc)}
+        if candidate_id is not None:
+            values["candidate_id"] = candidate_id
+        if first_message_id is not None:
+            values["first_message_id"] = first_message_id
+        if error_type is not None:
+            values["error_type"] = error_type[:100]
+        if alert_required:
+            values["alert_required"] = True
+        async with self.sessions() as session:
+            await session.execute(
+                update(JoinRequestEvent)
+                .where(JoinRequestEvent.update_id == update_id)
+                .values(**values)
+            )
+            await session.commit()
+
+    async def mark_join_request_alerted(self, update_id: int) -> None:
+        async with self.sessions() as session:
+            await session.execute(
+                update(JoinRequestEvent)
+                .where(JoinRequestEvent.update_id == update_id)
+                .values(admin_alerted_at=datetime.now(timezone.utc))
+            )
+            await session.commit()
+
+    async def recover_unconfirmed_join_requests(
+        self, cutoff: datetime, *, excluding_update_ids: set[int] | None = None,
+    ) -> int:
+        """Fail closed on an interrupted first DM; never auto-decline by timeout.
+
+        No retry of send_message: a timeout may mean Telegram delivered it.
+        Active stage-1 interviews become pending_admin, and an alert is queued.
+        If a reply is already present, preserve the active interview instead.
+        """
+        async with self.sessions() as session:
+            conditions = [
+                JoinRequestEvent.status.in_([
+                        "received", "candidate_created", "first_question_failed",
+                        "active_delivery_failed", "processing_error",
+                ]),
+                JoinRequestEvent.created_at < cutoff,
+            ]
+            if excluding_update_ids:
+                conditions.append(JoinRequestEvent.update_id.not_in(excluding_update_ids))
+            events = list((await session.scalars(
+                select(JoinRequestEvent).where(*conditions)
+                .order_by(JoinRequestEvent.id).limit(100)
+            )).all())
+            for event in events:
+                candidate = await session.get(Candidate, event.candidate_id) if event.candidate_id else None
+                if candidate is None and event.request_date is not None:
+                    matches = list((await session.scalars(
+                        select(Candidate).where(
+                            Candidate.user_id == event.user_id,
+                            Candidate.target_chat_id == event.target_chat_id,
+                            Candidate.request_date == event.request_date,
+                        ).order_by(Candidate.id.desc()).limit(2)
+                    )).all())
+                    # Same-second withdraw/reapply can be ambiguous. Never
+                    # assign a ledger event to an arbitrary candidate.
+                    if len(matches) == 1:
+                        candidate = matches[0]
+                        event.candidate_id = candidate.id
+                if candidate and (candidate.stage > 1 or candidate.status not in (
+                    CandidateStatus.INTERVIEW.value, CandidateStatus.PENDING_ADMIN.value,
+                )):
+                    # A reply or subsequent decision is evidence the flow ran;
+                    # avoid overwriting the user's real progress or result.
+                    event.status = "flow_progressed"
+                else:
+                    event.status = "delivery_unconfirmed"
+                    event.alert_required = True
+                    if not event.error_type:
+                        event.error_type = "InterruptedBeforeDeliveryConfirmation"
+                    if candidate and candidate.status == CandidateStatus.INTERVIEW.value and candidate.stage == 1:
+                        candidate.status = CandidateStatus.PENDING_ADMIN.value
+                        candidate.decision_reason = (
+                            "Не подтверждена отправка первого вопроса после перезапуска; "
+                            "требуется ручная проверка"
+                        )
+                        candidate.updated_at = datetime.now(timezone.utc)
+                event.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            return len(events)
+
+    async def list_pending_join_request_alerts(self, limit: int = 30) -> list[JoinRequestEvent]:
+        async with self.sessions() as session:
+            return list((await session.scalars(
+                select(JoinRequestEvent).where(
+                    JoinRequestEvent.alert_required.is_(True),
+                    JoinRequestEvent.admin_alerted_at.is_(None),
+                ).order_by(JoinRequestEvent.id).limit(limit)
+            )).all())
+
+    async def list_unlinked_join_request_events(self, target_chat_id: int) -> list[JoinRequestEvent]:
+        """Events without a candidate; useful in /status to spot processing gaps."""
+        async with self.sessions() as session:
+            return list((await session.scalars(
+                select(JoinRequestEvent).where(
+                    JoinRequestEvent.target_chat_id == target_chat_id,
+                    JoinRequestEvent.candidate_id.is_(None),
+                    JoinRequestEvent.status.in_([
+                        "delivery_unconfirmed", "processing_error",
+                    ]),
+                ).order_by(JoinRequestEvent.created_at, JoinRequestEvent.id)
+            )).all())
+
+    async def get_status_history(
+        self, target_chat_id: int,
+    ) -> tuple[list[Candidate], list[CooldownDeclinedJoinRequest]]:
+        """Full persisted application history for an authenticated admin's /status.
+
+        These are attempts rather than distinct users. ChatJoinRequests that never
+        reached persistence cannot be reconstructed from Telegram via Bot API.
+        """
+        async with self.sessions() as session:
+            candidates = (await session.scalars(
+                select(Candidate)
+                .where(Candidate.target_chat_id == target_chat_id)
+                .order_by(Candidate.created_at, Candidate.id)
+            )).all()
+            cooldowns = (await session.scalars(
+                select(CooldownDeclinedJoinRequest)
+                .where(CooldownDeclinedJoinRequest.target_chat_id == target_chat_id)
+                .order_by(CooldownDeclinedJoinRequest.request_date, CooldownDeclinedJoinRequest.id)
+            )).all()
+            return list(candidates), list(cooldowns)
 
     async def count_by_status(self) -> dict[str, int]:
         async with self.sessions() as session:

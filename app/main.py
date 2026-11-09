@@ -47,6 +47,7 @@ def main() -> None:
         while True:
             try:
                 await handlers.recover_stale_scoring(application.bot)
+                await handlers.recover_and_alert_join_requests(application.bot)
                 await handlers.recover_cooldown_decline_intents(application.bot)
                 await handlers.expire_stale_interviews(application.bot)
                 await handlers.support.retry_due_messages(application.bot)
@@ -61,6 +62,7 @@ def main() -> None:
         await db.init()
         # The old process is gone. Recover interrupted LLM work before polling.
         await handlers.recover_stale_scoring(application.bot, startup=True)
+        await handlers.recover_and_alert_join_requests(application.bot)
         await handlers.recover_cooldown_decline_intents(application.bot)
         me = await application.bot.get_me()
         logger.info("Solidus AI Gatekeeper started as @%s", me.username)
@@ -85,6 +87,11 @@ def main() -> None:
 
     # Handler structure intentionally follows Ringo's successful pattern:
     # join request -> questionnaire -> callback-based admin verdict.
+    async def on_application_error(update: object, context) -> None:
+        # Avoid noisy PTB 'No error handlers are registered' and retain traceback.
+        logger.error("Unhandled Telegram update error", exc_info=context.error)
+
+    application.add_error_handler(on_application_error)
     application.add_handler(ChatJoinRequestHandler(handlers.on_join_request))
     application.add_handler(
         CallbackQueryHandler(
@@ -93,7 +100,8 @@ def main() -> None:
         )
     )
     application.add_handler(CommandHandler("start", handlers.on_start))
-    application.add_handler(CommandHandler("status", handlers.on_status))
+    # Full-history report may require one document; do not block join requests.
+    application.add_handler(CommandHandler("status", handlers.on_status, block=False))
     application.add_handler(CommandHandler("support_failed", handlers.support.on_failed_messages))
     application.add_handler(CommandHandler("support_retry", handlers.support.on_retry_command))
     application.add_handler(

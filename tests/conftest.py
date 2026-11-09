@@ -44,7 +44,7 @@ except ModuleNotFoundError:
             self.inline_keyboard = inline_keyboard
 
     class ChatMemberStatus:
-        OWNER = "owner"
+        OWNER = "creator"  # Telegram API string; python-telegram-bot ChatMemberStatus.OWNER
         ADMINISTRATOR = "administrator"
 
     class ChatType:

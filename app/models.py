@@ -68,6 +68,40 @@ class Candidate(Base):
     )
 
 
+class JoinRequestEvent(Base):
+    """Durable receipt and first-question delivery evidence for Telegram updates.
+
+    Telegram does not offer a historical pending-request listing via Bot API.
+    This table records only events the bot actually received. update_id makes
+    re-delivery of one Telegram update idempotent for the audit ledger.
+    """
+
+    __tablename__ = "join_request_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    update_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+    target_chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    request_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    candidate_id: Mapped[int | None] = mapped_column(
+        ForeignKey("candidates.id"), nullable=True, index=True,
+    )
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="received")
+    first_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    alert_required: Mapped[bool] = mapped_column(
+        default=False, nullable=False, server_default=text("false"),
+    )
+    admin_alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
 class CooldownDeclinedJoinRequest(Base):
     """Telegram attempts declined during cooldown, retained for replay protection.
 
