@@ -49,6 +49,7 @@ def main() -> None:
                 await handlers.recover_stale_scoring(application.bot)
                 await handlers.recover_and_alert_join_requests(application.bot)
                 await handlers.recover_cooldown_decline_intents(application.bot)
+                await handlers.recover_captcha_actions(application.bot)
                 await handlers.expire_stale_interviews(application.bot)
                 await handlers.support.retry_due_messages(application.bot)
             except asyncio.CancelledError:
@@ -64,6 +65,7 @@ def main() -> None:
         await handlers.recover_stale_scoring(application.bot, startup=True)
         await handlers.recover_and_alert_join_requests(application.bot)
         await handlers.recover_cooldown_decline_intents(application.bot)
+        await handlers.recover_captcha_actions(application.bot)
         me = await application.bot.get_me()
         logger.info("Solidus AI Gatekeeper started as @%s", me.username)
         maintenance_task = asyncio.create_task(
@@ -93,6 +95,9 @@ def main() -> None:
 
     application.add_error_handler(on_application_error)
     application.add_handler(ChatJoinRequestHandler(handlers.on_join_request))
+    application.add_handler(
+        CallbackQueryHandler(handlers.on_captcha, pattern=r"^captcha:\d+:[0-9a-f]{8}:\d$")
+    )
     application.add_handler(
         CallbackQueryHandler(
             handlers.on_admin_decision,

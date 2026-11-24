@@ -9,7 +9,7 @@ from datetime import timedelta
 from collections import Counter
 from datetime import datetime, timezone
 
-from sqlalchemy import and_, exists, func, or_, select, text, update
+from sqlalchemy import and_, case, exists, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -63,6 +63,25 @@ class Database:
                     await conn.execute(text(
                         "ALTER TABLE candidates ADD COLUMN request_date DATETIME"
                     ))
+            # Emoji captcha state (additive, idempotent). Old rows keep NULL/0.
+            for name, pg_def, sqlite_def in (
+                ("captcha_correct_index", "INTEGER", "INTEGER"),
+                ("captcha_token", "VARCHAR(16)", "VARCHAR(16)"),
+                ("captcha_attempts", "INTEGER NOT NULL DEFAULT 0", "INTEGER NOT NULL DEFAULT 0"),
+                ("captcha_deadline_at", "TIMESTAMP WITH TIME ZONE", "DATETIME"),
+                ("captcha_pending_action", "VARCHAR(32)", "VARCHAR(32)"),
+                ("captcha_notice_pending", "BOOLEAN NOT NULL DEFAULT false", "BOOLEAN NOT NULL DEFAULT false"),
+            ):
+                if conn.dialect.name == "postgresql":
+                    await conn.execute(text(
+                        f"ALTER TABLE candidates ADD COLUMN IF NOT EXISTS {name} {pg_def}"
+                    ))
+                elif conn.dialect.name == "sqlite":
+                    info = await conn.execute(text("PRAGMA table_info(candidates)"))
+                    if name not in {row[1] for row in info.all()}:
+                        await conn.execute(text(
+                            f"ALTER TABLE candidates ADD COLUMN {name} {sqlite_def}"
+                        ))
             # New states for the existing replay ledger. Backfill historical
             # successful declines with status='declined' via the DEFAULT; do not
             # rewrite, delete or silently confirm in-flight attempts.
@@ -403,6 +422,8 @@ class Database:
         username: str | None,
         first_name: str | None,
         request_date: datetime | None = None,
+        stage: int = 1,
+        captcha_timeout_minutes: int = 3,
     ) -> Candidate:
         async with self.sessions() as session:
             await session.execute(
@@ -420,6 +441,7 @@ class Database:
                 )
                 .values(status=CandidateStatus.SUPERSEDED.value)
             )
+            now = datetime.now(timezone.utc)
             candidate = Candidate(
                 user_id=user_id,
                 user_chat_id=user_chat_id,
@@ -428,7 +450,10 @@ class Database:
                 first_name=first_name,
                 request_date=request_date,
                 status=CandidateStatus.INTERVIEW.value,
-                stage=1,
+                stage=stage,
+                created_at=now, updated_at=now,
+                captcha_deadline_at=(now + timedelta(minutes=captcha_timeout_minutes)
+                                     if stage == 0 else None),
             )
             session.add(candidate)
             await session.commit()
@@ -611,15 +636,23 @@ class Database:
             )
             return await session.scalar(stmt)
 
-    async def list_expired_interviews(self, cutoff: datetime) -> list[Candidate]:
+    async def list_expired_interviews(
+        self, cutoff: datetime, *, captcha_cutoff: datetime | None = None
+    ) -> list[Candidate]:
+        """Stale questionnaires. Stage 0 (captcha) uses its own, shorter cutoff."""
         async with self.sessions() as session:
+            if captcha_cutoff is None:
+                age = and_(Candidate.stage <= 3, Candidate.updated_at < cutoff)
+            else:
+                age = or_(
+                    and_(Candidate.stage >= 1, Candidate.stage <= 3,
+                         Candidate.updated_at < cutoff),
+                    and_(Candidate.stage == 0, Candidate.captcha_pending_action.is_(None),
+                         self._captcha_expired(datetime.now(timezone.utc), captcha_cutoff)),
+                )
             stmt = (
                 select(Candidate)
-                .where(
-                    Candidate.status == CandidateStatus.INTERVIEW.value,
-                    Candidate.stage <= 3,
-                    Candidate.updated_at < cutoff,
-                )
+                .where(Candidate.status == CandidateStatus.INTERVIEW.value, age)
                 .order_by(Candidate.updated_at.asc())
             )
             result = await session.scalars(stmt)
@@ -638,6 +671,204 @@ class Database:
             await session.commit()
             await session.refresh(candidate)
             return candidate
+
+    @staticmethod
+    def _captcha_expired(now: datetime, legacy_cutoff: datetime):
+        # Legacy rows have no absolute deadline. Use creation, NOT updated_at,
+        # so old retries cannot grant another full interval.
+        return or_(and_(Candidate.captcha_deadline_at.is_not(None),
+                        Candidate.captcha_deadline_at <= now),
+                   and_(Candidate.captcha_deadline_at.is_(None),
+                        Candidate.created_at <= legacy_cutoff))
+
+    @staticmethod
+    def _captcha_active(candidate_id: int):
+        return (Candidate.id == candidate_id,
+                Candidate.status == CandidateStatus.INTERVIEW.value,
+                Candidate.stage == 0)
+
+    async def set_captcha(self, candidate_id: int, correct_index: int, token: str,
+                          *, max_attempts: int = 2, timeout_minutes: int = 3) -> Candidate | None:
+        """Issue only while the original window and attempt budget are valid."""
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(minutes=timeout_minutes)
+        async with self.sessions() as session:
+            row = await session.get(Candidate, candidate_id)
+            if row is None:
+                return None
+            created = row.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            deadline = created + timedelta(minutes=timeout_minutes)
+            result = await session.execute(
+                update(Candidate).where(
+                    *self._captcha_active(candidate_id),
+                    Candidate.captcha_attempts < max_attempts,
+                    or_(Candidate.captcha_pending_action.is_(None),
+                        Candidate.captcha_pending_action == "retry_delivery"),
+                    ~self._captcha_expired(now, cutoff),
+                ).values(captcha_correct_index=correct_index, captcha_token=token,
+                         captcha_deadline_at=func.coalesce(Candidate.captcha_deadline_at, deadline),
+                         updated_at=now).returning(Candidate.id).execution_options(synchronize_session=False)
+            )
+            updated_id = result.scalar_one_or_none()
+            await session.commit()
+            if updated_id is None:
+                return None
+            await session.refresh(row)
+            return row
+
+    async def answer_captcha(self, candidate_id: int, *, token: str, chosen_index: int,
+                             max_attempts: int, timeout_minutes: int = 3) -> tuple[str, Candidate | None]:
+        """Grade atomically; persist delivery/decline intent before Telegram calls."""
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(minutes=timeout_minutes)
+        expired = self._captcha_expired(now, cutoff)
+        base = (*self._captcha_active(candidate_id), Candidate.captcha_token == token,
+                Candidate.captcha_pending_action.is_(None), Candidate.captcha_attempts < max_attempts)
+        async with self.sessions() as session:
+            for outcome, conditions, values in (
+                ("expired", (expired,), dict(captcha_pending_action="decline_timeout")),
+                ("passed", (~expired, Candidate.captcha_correct_index == chosen_index),
+                 dict(stage=1, captcha_pending_action="first_question")),
+                ("wrong", (~expired, Candidate.captcha_correct_index.is_not(None),
+                           Candidate.captcha_correct_index != chosen_index),
+                 dict(captcha_attempts=Candidate.captcha_attempts + 1,
+                      captcha_pending_action=case(
+                          (Candidate.captcha_attempts + 1 >= max_attempts, "decline_failed"),
+                          else_="retry_delivery"))),
+            ):
+                result = await session.execute(update(Candidate).where(*base, *conditions)
+                    .values(**values, captcha_correct_index=None, captcha_token=None,
+                            updated_at=now).returning(Candidate.id))
+                updated_id = result.scalar_one_or_none()
+                if updated_id is not None:
+                    if outcome == "passed":
+                        # The candidate transition and its join-request ledger
+                        # transition must commit together. If the process dies
+                        # after this commit, recovery knows the CAPTCHA passed
+                        # but the first questionnaire message may still be
+                        # unconfirmed.
+                        await session.execute(
+                            update(JoinRequestEvent).where(
+                                JoinRequestEvent.candidate_id == candidate_id,
+                                JoinRequestEvent.status.in_(
+                                    ("captcha_sent", "candidate_created", "processing_error")
+                                ),
+                            ).values(status="captcha_passed", updated_at=now)
+                        )
+                    await session.commit()
+                    row = await session.get(Candidate, updated_id)
+                    if outcome == "wrong":
+                        outcome = "failed" if row.captcha_attempts >= max_attempts else "retry"
+                    return outcome, row
+            await session.commit()
+            return "stale", None
+
+    async def claim_captcha_timeout(self, candidate_id: int, *, timeout_minutes: int,
+                                    max_attempts: int, action: str | None = None) -> Candidate | None:
+        now = datetime.now(timezone.utc)
+        condition = (Candidate.captcha_pending_action.is_(None) if action is None
+                     else Candidate.captcha_pending_action == action)
+        async with self.sessions() as session:
+            result = await session.execute(update(Candidate).where(
+                *self._captcha_active(candidate_id), condition,
+                Candidate.captcha_attempts < max_attempts,
+                self._captcha_expired(now, now - timedelta(minutes=timeout_minutes)),
+            ).values(captcha_pending_action="decline_timeout", captcha_token=None,
+                     captcha_correct_index=None, updated_at=now).returning(Candidate.id))
+            key = result.scalar_one_or_none()
+            await session.commit()
+            return await session.get(Candidate, key) if key is not None else None
+
+    async def confirm_captcha_delivery(
+        self, candidate_id: int, action: str, *, first_message_id: int | None = None,
+    ) -> bool:
+        """Acknowledge a Telegram delivery and its ledger state atomically."""
+        now = datetime.now(timezone.utc)
+        async with self.sessions() as session:
+            result = await session.execute(update(Candidate).where(
+                Candidate.id == candidate_id, Candidate.status == CandidateStatus.INTERVIEW.value,
+                Candidate.captcha_pending_action == action,
+            ).values(captcha_pending_action=None, updated_at=now))
+            confirmed = result.rowcount == 1
+            if confirmed and action == "first_question":
+                event_values = {"status": "first_question_sent", "updated_at": now}
+                if isinstance(first_message_id, int):
+                    event_values["first_message_id"] = first_message_id
+                await session.execute(update(JoinRequestEvent).where(
+                    JoinRequestEvent.candidate_id == candidate_id,
+                    JoinRequestEvent.status.in_(
+                        ("captcha_passed", "captcha_sent", "candidate_created", "processing_error")
+                    ),
+                ).values(**event_values))
+            await session.commit()
+            return confirmed
+
+    async def finish_captcha_action(self, candidate_id: int, action: str | None, *,
+                                    reason: str, expired: bool = False,
+                                    exhausted_limit: int | None = None) -> Candidate | None:
+        """Atomically close the intent and enqueue a card on uncertain outcomes."""
+        condition = (Candidate.captcha_pending_action.is_(None) if action is None
+                     else Candidate.captcha_pending_action == action)
+        clauses = [Candidate.id == candidate_id, Candidate.status == CandidateStatus.INTERVIEW.value,
+                   condition]
+        if action is None:
+            clauses.append(Candidate.stage == 0)
+            if exhausted_limit is not None:
+                clauses.append(Candidate.captcha_attempts >= exhausted_limit)
+        async with self.sessions() as session:
+            now = datetime.now(timezone.utc)
+            result = await session.execute(update(Candidate).where(*clauses).values(
+                status=(CandidateStatus.EXPIRED.value if expired else CandidateStatus.PENDING_ADMIN.value),
+                decision_reason=reason, captcha_pending_action=None, captcha_token=None,
+                captcha_correct_index=None, captcha_notice_pending=not expired,
+                updated_at=now,
+            ).returning(Candidate.id))
+            key = result.scalar_one_or_none()
+            if key is not None:
+                if expired:
+                    event_status = "captcha_timeout" if action == "decline_timeout" else "captcha_failed"
+                elif action == "first_question":
+                    event_status = "first_question_failed"
+                elif action == "retry_delivery":
+                    event_status = "captcha_delivery_failed"
+                else:
+                    event_status = "captcha_decline_unconfirmed"
+                await session.execute(update(JoinRequestEvent).where(
+                    JoinRequestEvent.candidate_id == candidate_id,
+                    JoinRequestEvent.status.in_(
+                        ("captcha_sent", "captcha_passed", "candidate_created", "processing_error")
+                    ),
+                ).values(status=event_status, updated_at=now))
+            await session.commit()
+            return await session.get(Candidate, key) if key is not None else None
+
+    async def list_captcha_recovery(self, max_attempts: int) -> list[Candidate]:
+        async with self.sessions() as session:
+            rows = await session.scalars(select(Candidate).where(
+                Candidate.status == CandidateStatus.INTERVIEW.value,
+                or_(Candidate.captcha_pending_action.is_not(None),
+                    and_(Candidate.stage == 0, Candidate.captcha_attempts >= max_attempts)),
+            ).order_by(Candidate.id))
+            return list(rows.all())
+
+    async def list_captcha_notices(self) -> list[Candidate]:
+        async with self.sessions() as session:
+            rows = await session.scalars(select(Candidate).where(
+                Candidate.status == CandidateStatus.PENDING_ADMIN.value,
+                Candidate.captcha_notice_pending.is_(True),
+            ).order_by(Candidate.id))
+            return list(rows.all())
+
+    async def mark_captcha_notice_sent(self, candidate_id: int) -> bool:
+        async with self.sessions() as session:
+            result = await session.execute(update(Candidate).where(
+                Candidate.id == candidate_id, Candidate.captcha_notice_pending.is_(True),
+                Candidate.status == CandidateStatus.PENDING_ADMIN.value,
+            ).values(captcha_notice_pending=False))
+            await session.commit()
+            return result.rowcount == 1
 
     async def save_answer(
         self, candidate_id: int, *, field: str, answer: str, next_stage: int
@@ -771,13 +1002,16 @@ class Database:
         """Fail closed on an interrupted first DM; never auto-decline by timeout.
 
         No retry of send_message: a timeout may mean Telegram delivered it.
-        Active stage-1 interviews become pending_admin, and an alert is queued.
-        If a reply is already present, preserve the active interview instead.
+        A sent-but-unconfirmed CAPTCHA or first questionnaire message becomes
+        pending_admin, and an alert is queued. If a reply is already present,
+        preserve the active interview instead. A confirmed captcha_sent event
+        is left to the CAPTCHA deadline/recovery path; it is not mistaken for
+        a missing first questionnaire message.
         """
         async with self.sessions() as session:
             conditions = [
                 JoinRequestEvent.status.in_([
-                        "received", "candidate_created", "first_question_failed",
+                        "received", "candidate_created", "captcha_passed",
                         "active_delivery_failed", "processing_error",
                 ]),
                 JoinRequestEvent.created_at < cutoff,
@@ -814,9 +1048,12 @@ class Database:
                     event.alert_required = True
                     if not event.error_type:
                         event.error_type = "InterruptedBeforeDeliveryConfirmation"
-                    if candidate and candidate.status == CandidateStatus.INTERVIEW.value and candidate.stage == 1:
+                    if candidate and candidate.status == CandidateStatus.INTERVIEW.value and candidate.stage <= 1:
                         candidate.status = CandidateStatus.PENDING_ADMIN.value
                         candidate.decision_reason = (
+                            "Не подтверждена отправка CAPTCHA после перезапуска; "
+                            "требуется ручная проверка"
+                            if candidate.stage == 0 else
                             "Не подтверждена отправка первого вопроса после перезапуска; "
                             "требуется ручная проверка"
                         )

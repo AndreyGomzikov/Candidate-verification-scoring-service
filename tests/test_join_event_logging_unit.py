@@ -1,6 +1,7 @@
 """Event flow tests independent of optional SQLite/Postgres drivers."""
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
@@ -53,11 +54,19 @@ class LedgerDB(Database):
         return None
 
     async def create_candidate(self, **values):
-        c = Candidate(id=self.next_candidate_id, status="interview", stage=1,
+        stage = values.pop("stage", 1)
+        values.pop("captcha_timeout_minutes", None)
+        c = Candidate(id=self.next_candidate_id, status="interview", stage=stage,
                       created_at=datetime.now(timezone.utc), **values)
         self.candidates[c.id] = c
         self.next_candidate_id += 1
         return c
+
+    async def set_captcha(self, candidate_id, correct_index, token, **_):
+        candidate = self.candidates[candidate_id]
+        candidate.captcha_correct_index = correct_index
+        candidate.captcha_token = token
+        return candidate
 
     async def set_status(self, candidate_id, status, *, reason=None, **_):
         c = self.candidates[candidate_id]
@@ -87,6 +96,24 @@ def test_first_question_success_audits_message_id():
         assert event.status == "first_question_sent"
         assert event.first_message_id == 703
         assert db.candidates[event.candidate_id].status == "interview"
+        bot.send_message.assert_awaited_once()
+    asyncio.run(run())
+
+
+def test_captcha_delivery_is_not_audited_as_first_question():
+    async def run():
+        db = LedgerDB()
+        bot = NS(send_message=AsyncMock(return_value=NS(message_id=704)))
+        handler = GatekeeperHandlers(
+            settings=replace(settings(), captcha_enabled=True), db=db, scorer=NoopScorer(),
+        )
+        await handler.on_join_request(join_update(45), NS(bot=bot))
+        event = db.events[45]
+        candidate = db.candidates[event.candidate_id]
+        assert event.status == "captcha_sent"
+        assert event.first_message_id is None
+        assert candidate.stage == 0
+        assert candidate.captcha_token
         bot.send_message.assert_awaited_once()
     asyncio.run(run())
 

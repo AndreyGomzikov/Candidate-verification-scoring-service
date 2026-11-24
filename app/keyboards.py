@@ -43,3 +43,18 @@ def support_retry_keyboard(message_id: int) -> InlineKeyboardMarkup:
             "🔄 Повторить доставку", callback_data=f"support:retry:{message_id}"
         )]]
     )
+
+
+def captcha_keyboard(
+    candidate_id: int, token: str, options: tuple[str, ...] | list[str]
+) -> InlineKeyboardMarkup:
+    """One row of emoji buttons. callback_data carries only the pressed position
+    and the per-captcha token, never the right answer."""
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                emoji, callback_data=f"captcha:{candidate_id}:{token}:{index}"
+            )
+            for index, emoji in enumerate(options)
+        ]]
+    )

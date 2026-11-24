@@ -40,7 +40,23 @@ class Candidate(Base):
     status: Mapped[str] = mapped_column(
         String(32), default=CandidateStatus.INTERVIEW.value, index=True
     )
+    # stage 0 = emoji captcha pending (only when CAPTCHA_ENABLED); 1-3 = questions.
     stage: Mapped[int] = mapped_column(Integer, default=1)
+    # Server-side captcha state. The right answer never appears in callback_data.
+    captcha_correct_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    captcha_token: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    captcha_attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+
+    # Absolute deadline; retries and redelivery never extend it.
+    captcha_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Durable external-operation intent. Never replay an uncertain decline.
+    captcha_pending_action: Mapped[str | None] = mapped_column(String(32))
+    # Durable moderation-card outbox (one pending card per candidate).
+    captcha_notice_pending: Mapped[bool] = mapped_column(
+        default=False, server_default=text("false"), nullable=False
+    )
 
     location_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     business_answer: Mapped[str | None] = mapped_column(Text, nullable=True)

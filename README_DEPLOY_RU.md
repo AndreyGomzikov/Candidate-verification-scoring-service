@@ -1,95 +1,89 @@
-# AI-Гейткипер — подготовка Epic 6: изолированный PostgreSQL
+# AI Gatekeeper — изолированное тестовое развёртывание с эмодзи-CAPTCHA
 
-Этот пакет собран из переданного архива Candidate-verification-scoring-service и не содержит пользовательский `.env`, SSH-пароль, API-ключи или Git-историю. Код бизнес-логики не изменён. Внесены только изменения конфигурации Docker Compose, шаблона окружения, исключений Docker-контекста и скрипт создания резервной копии.
+Этот пакет предназначен для отдельного тестового окружения на Contabo. Он содержит исходный код, тесты, документацию и Docker-конфигурацию. Файл `.env` с секретами в архив не включён.
 
-## Перед началом
+## Целевая директория на сервере
 
-1. Смените ранее опубликованные учётные данные SSH, токен Telegram-бота через BotFather и API-ключ DeepSeek. Новые значения храните только на сервере.
-2. Для первых тестов используйте ОТДЕЛЬНЫЙ тестовый чат Telegram, а не рабочее сообщество.
-3. Папка /var/sftp/AI-Gatekeeper уже выделена вам. Не трогайте существующие контейнеры других проектов.
-4. Пакет рассчитан на Docker + Docker Compose и 1 экземпляр приложения (long polling).
+```text
+/home/andrewgf1/solidus-captcha-test
+```
 
-## Загрузка пакета (PowerShell на Windows)
+В этой директории уже должен находиться подготовленный файл `.env` с отдельными тестовыми секретами и параметрами. Не копируйте рабочий `.env` из проекта `ai-gatekeeper`.
 
-После скачивания ZIP, находясь в папке, куда скачан файл:
+## 1. Загрузка ZIP с Windows PowerShell
 
 ```powershell
-scp -P 22 "AI-Gatekeeper_PostgreSQL_пакет.zip" andrewgf1@161.97.72.91:/var/sftp/AI-Gatekeeper/
+scp -P 22 "solidus-captcha-test.zip" andrewgf1@161.97.72.91:/home/andrewgf1/solidus-captcha-test/
 ```
 
-## На сервере — распаковка без запуска бота
+## 2. Распаковка на сервере
 
 ```bash
-cd /var/sftp/AI-Gatekeeper
-unzip -n AI-Gatekeeper_PostgreSQL_пакет.zip
+cd /home/andrewgf1/solidus-captcha-test
 ls -la
+unzip -n solidus-captcha-test.zip
 ```
 
-Если unzip не установлен, используйте `python3 -m zipfile -e AI-Gatekeeper_PostgreSQL_пакет.zip .`; предварительно убедитесь, что не перезаписываете ваши файлы.
+Архив распаковывается прямо в текущую директорию, без дополнительной вложенной папки. Ключ `-n` запрещает перезапись уже существующих файлов. В архиве нет `.env`, поэтому подготовленный серверный `.env` сохраняется.
 
-## Настройка конфиденциального .env
+Проверьте наличие конфигурации и права доступа, не выводя её содержимое:
 
 ```bash
-cd /var/sftp/AI-Gatekeeper
-umask 077
-cp -n .env.example .env
-openssl rand -hex 24
-nano .env
+test -s .env && echo 'OK: .env exists' || echo 'ERROR: .env missing'
+stat -c '%a %n' .env
 chmod 600 .env
 ```
 
-Вставьте сгенерированную шестнадцатеричную строку в `POSTGRES_PASSWORD`. Заполните остальные переменные новыми токенами и ID **тестовых** Telegram-чатов. Запрещается пересылать полный `.env` в чат.
+Ожидаемые права доступа — `600`.
 
-**Важно:** В предыдущем `.env` было `LLM_API_URL`; программный код ожидает `LLM_BASE_URL`. Для DeepSeek используется именно `LLM_BASE_URL=https://api.deepseek.com`. Приложение само дописывает `/chat/completions`. `LLM_MODEL=deepseek-v4-pro`.
-
-## Предварительная проверка
+## 3. Проверка Compose без запуска контейнеров
 
 ```bash
-cd /var/sftp/AI-Gatekeeper
-docker compose config --quiet
+docker compose -p solidus-captcha-test --env-file .env config -q
 ```
 
-Внимание: не показывайте вывод `docker compose config` без `--quiet`, т.к. он может содержать переменные с ключами.
+Команда должна завершиться без ошибок. Не запускайте `docker compose config` без `-q` и не публикуйте его полный вывод: он может содержать секреты.
 
-## Запуск ТОЛЬКО отдельной БД, без бота
+## 4. Сначала запустить только отдельную PostgreSQL
 
 ```bash
-docker compose up -d postgres
-docker compose ps
-docker compose exec -T postgres pg_isready -U gatekeeper -d gatekeeper
+docker compose -p solidus-captcha-test --env-file .env up -d postgres
+docker compose -p solidus-captcha-test ps
+docker compose -p solidus-captcha-test exec -T postgres pg_isready -U gatekeeper -d gatekeeper
 ```
 
-Ожидается сервис `ai-gatekeeper-postgres-1` со статусом `healthy`, порт 5432 наружу не публикуется.
+Дождитесь состояния `healthy` и ответа `accepting connections`.
 
-## После проверки БД и тестовых Telegram ID
+## 5. Затем запустить тестового бота
 
-**Не запускать до подтверждения токена и ID тестовых чатов:**
+Перед запуском убедитесь, что `BOT_TOKEN` принадлежит отдельному тестовому боту и не используется другим запущенным процессом long polling. `TARGET_CHAT_ID` должен указывать на тестовую группу, `ADMIN_CHAT_ID` — на тестовый административный чат. Если нужно строго закрепить одного модератора, заполните `ADMIN_USER_IDS` его числовым Telegram User ID.
 
 ```bash
-docker compose up -d --build gatekeeper
-docker compose ps
-docker compose logs --tail=40 gatekeeper
+docker compose -p solidus-captcha-test --env-file .env up -d --build gatekeeper
+docker compose -p solidus-captcha-test ps
+docker compose -p solidus-captcha-test logs --tail=60 gatekeeper
 ```
 
-В логах не должны отображаться токены. Нельзя использовать один токен Telegram в двух одновременных long-polling процессах.
+Не отправляйте в чат полный `.env` и не публикуйте логи, если в них случайно попали секреты или персональные данные.
 
-## Резервные копии (после проверки PostgreSQL)
+## 6. Изоляция и запреты
+
+- Compose project принудительно задаётся как `solidus-captcha-test`; в `docker-compose.yml` также установлено безопасное имя этого тестового проекта.
+- PostgreSQL использует отдельный Compose volume с префиксом `solidus-captcha-test`.
+- Порт PostgreSQL наружу не публикуется.
+- Не используйте рабочий токен Telegram одновременно в двух процессах long polling.
+- Не направляйте тестового бота в рабочую группу.
+- Не выполняйте `docker compose down -v`, `docker volume prune` или `docker system prune --volumes`.
+- Не останавливайте и не пересоздавайте контейнеры `ai-gatekeeper`, `v-it`, `ai_digest_bot` и других проектов.
+
+Остановка только тестового проекта (без удаления базы данных):
 
 ```bash
-bash scripts/backup_db.sh
-ls -lh backups/
+docker compose -p solidus-captcha-test stop
 ```
 
-Скрипт создаёт файл вида `backups/gatekeeper_YYYYMMDDTHHMMSSZ.sql.gz`. Рекомендуется дополнительно копировать backup за пределы сервера и тестировать восстановление. **Автоматическое расписание и проверка восстановления пока не настроены.**
+Для последующего запуска:
 
-## Что остаётся для закрытия Epic 6
-
-- Проверить реальные полномочия бота и тестовые Telegram ID.
-- Проверить подключение к DeepSeek без ошибок и старт микросервиса.
-- Настроить CI и проверку тестов.
-- Проверить бэкап и восстановление; добавить процедуру отката и журнал операций.
-- Уточнить третий сторонний лицензируемый код: README ссылается на `LICENSE.ringo` и `THIRD_PARTY_NOTICES.md`, но их нет в исходном архиве.
-
-## Запрещённые/опасные действия
-
-Не используйте `docker compose down -v` — эта команда удалит том PostgreSQL AI-Гейткипера. Не используйте `docker system prune --volumes`, `docker volume prune` или команды остановки/удаления контейнеров других проектов.
+```bash
+docker compose -p solidus-captcha-test --env-file .env up -d
+```

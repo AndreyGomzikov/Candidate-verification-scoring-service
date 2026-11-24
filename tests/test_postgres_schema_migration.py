@@ -107,6 +107,8 @@ def test_postgres_legacy_request_date_migration_and_cooldown_ledger():
             # the main database are never affected: search_path is test-only.
             async with db.engine.begin() as conn:
                 await conn.execute(text("ALTER TABLE candidates DROP COLUMN request_date"))
+                for column in ("captcha_deadline_at", "captcha_pending_action", "captcha_notice_pending"):
+                    await conn.execute(text(f"ALTER TABLE candidates DROP COLUMN {column}"))
                 await conn.execute(text(
                     "ALTER TABLE cooldown_declined_join_requests DROP COLUMN status"
                 ))
@@ -123,6 +125,22 @@ def test_postgres_legacy_request_date_migration_and_cooldown_ledger():
             assert preserved is not None
             assert preserved.user_id == user
             assert preserved.request_date is None  # Unknown for legacy rows
+            assert preserved.captcha_deadline_at is None
+            assert preserved.captcha_pending_action is None
+            assert preserved.captcha_notice_pending is False
+            # Actual PostgreSQL state machine, including a second DB connection.
+            captcha = await db.create_candidate(user_id=user+1, user_chat_id=user+1,
+                target_chat_id=chat, username="captcha", first_name="Test", stage=0)
+            assert await db.set_captcha(captcha.id, 1, "aaaaaaaa", max_attempts=1)
+            outcome, row = await other.answer_captcha(captcha.id, token="aaaaaaaa",
+                chosen_index=0, max_attempts=1)
+            assert outcome == "failed" and row.captcha_pending_action == "decline_failed"
+            assert await db.set_captcha(captcha.id, 1, "bbbbbbbb", max_attempts=1) is None
+            row = await db.finish_captcha_action(captcha.id, "decline_failed", reason="uncertain")
+            assert row.captcha_notice_pending
+            assert [c.id for c in await other.list_captcha_notices()] == [captcha.id]
+            assert await other.mark_captcha_notice_sent(captcha.id)
+            assert await db.list_captcha_notices() == []
             async with db.sessions() as session:
                 records = (await session.scalars(select(Attempt))).all()
                 assert len(records) == 3  # Identical dates were deduplicated.

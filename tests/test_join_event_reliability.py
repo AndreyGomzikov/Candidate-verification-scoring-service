@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
@@ -66,6 +67,58 @@ def test_join_event_is_committed_before_first_send_and_records_telegram_message_
     with_db(tmp_path, scenario)
 
 
+def test_captcha_send_is_not_recorded_as_first_question_and_pass_records_real_message_id(tmp_path):
+    async def scenario(db):
+        bot = NS(send_message=AsyncMock(side_effect=[NS(message_id=123), NS(message_id=456)]))
+        captcha_settings = replace(settings(), captcha_enabled=True)
+        handler = GatekeeperHandlers(settings=captcha_settings, db=db, scorer=NoopScorer())
+        update = make_update(5101)
+
+        await handler.on_join_request(update, NS(bot=bot))
+        event = await get_event(db, 5101)
+        assert event.status == "captcha_sent"
+        assert event.first_message_id is None
+        candidate = await db.get_candidate(event.candidate_id)
+        assert candidate.stage == 0
+        assert candidate.captcha_token
+        assert bot.send_message.await_count == 1
+
+        query = NS(
+            data=f"captcha:{candidate.id}:{candidate.captcha_token}:{candidate.captcha_correct_index}",
+            from_user=NS(id=candidate.user_id),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        await handler.on_captcha(NS(callback_query=query), NS(bot=bot))
+
+        event = await get_event(db, 5101)
+        assert event.status == "first_question_sent"
+        assert event.first_message_id == 456
+        candidate = await db.get_candidate(candidate.id)
+        assert candidate.stage == 1
+        assert candidate.captcha_pending_action is None
+        assert bot.send_message.await_count == 2
+    with_db(tmp_path, scenario)
+
+
+def test_captcha_delivery_failure_is_not_misreported_as_first_question_failure(tmp_path):
+    async def scenario(db):
+        bot = NS(send_message=AsyncMock(side_effect=[TelegramError("captcha offline"), NS(message_id=82)]))
+        handler = GatekeeperHandlers(
+            settings=replace(settings(), captcha_enabled=True), db=db, scorer=NoopScorer(),
+        )
+        await handler.on_join_request(make_update(5102), NS(bot=bot))
+        event = await get_event(db, 5102)
+        candidate = await db.get_candidate(event.candidate_id)
+        assert event.status == "captcha_delivery_failed"
+        assert event.error_type == "TelegramError"
+        assert event.alert_required is True
+        assert candidate.status == CandidateStatus.PENDING_ADMIN.value
+        assert candidate.stage == 0
+        assert event.first_message_id is None
+    with_db(tmp_path, scenario)
+
+
 def test_first_question_forbidden_is_manual_not_expired_and_admin_notified(tmp_path):
     async def scenario(db):
         send = AsyncMock(side_effect=[TelegramError("bot can't initiate conversation"), NS(message_id=82)])
@@ -125,6 +178,43 @@ def test_crash_between_candidate_and_send_is_not_auto_declined(tmp_path):
         assert (await get_event(db, 5004)).status == "delivery_unconfirmed"
         assert (await get_event(db, 5004)).admin_alerted_at is not None
         assert await h.expire_stale_interviews(bot) == 0
+        bot.decline_chat_join_request.assert_not_awaited()
+    with_db(tmp_path, scenario)
+
+
+def test_restart_after_captcha_pass_before_first_question_fails_closed(tmp_path):
+    async def scenario(db):
+        when = datetime.now(timezone.utc) - timedelta(minutes=4)
+        await db.record_join_request_event(
+            update_id=5103, target_chat_id=-1001, user_id=903, request_date=when,
+        )
+        candidate = await db.create_candidate(
+            user_id=903, user_chat_id=20903, target_chat_id=-1001,
+            username="sample", first_name="X", request_date=when, stage=0,
+        )
+        await db.update_join_request_event(5103, "captcha_sent", candidate_id=candidate.id)
+        await db.set_captcha(candidate.id, 2, "recovery-token")
+        outcome, candidate = await db.answer_captcha(
+            candidate.id, token="recovery-token", chosen_index=2, max_attempts=2,
+        )
+        assert outcome == "passed"
+        assert (await get_event(db, 5103)).status == "captcha_passed"
+        async with db.sessions() as session:
+            await session.execute(update(JoinRequestEvent).where(
+                JoinRequestEvent.update_id == 5103,
+            ).values(created_at=when))
+            await session.commit()
+
+        handler = GatekeeperHandlers(settings=settings(), db=db, scorer=NoopScorer())
+        bot = NS(send_message=AsyncMock(return_value=NS(message_id=99)),
+                 decline_chat_join_request=AsyncMock())
+        assert await handler.recover_and_alert_join_requests(bot) == 1
+        recovered = await db.get_candidate(candidate.id)
+        event = await get_event(db, 5103)
+        assert recovered.status == CandidateStatus.PENDING_ADMIN.value
+        assert "первого вопроса" in recovered.decision_reason
+        assert event.status == "delivery_unconfirmed"
+        assert event.admin_alerted_at is not None
         bot.decline_chat_join_request.assert_not_awaited()
     with_db(tmp_path, scenario)
 

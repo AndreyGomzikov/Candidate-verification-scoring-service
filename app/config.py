@@ -20,6 +20,13 @@ def _int(name: str, default: int | None = None) -> int:
     return int(raw)
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _int_set(name: str) -> set[int]:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -47,6 +54,12 @@ class Settings:
     maintenance_interval_seconds: int = 60
     support_rate_limit_count: int = 5
     support_rate_limit_seconds: int = 60
+    # Emoji captcha before the questionnaire. The dataclass default is False so
+    # that code constructing Settings directly keeps the old behaviour; the
+    # production entry point (from_env) turns it ON unless CAPTCHA_ENABLED=false.
+    captcha_enabled: bool = False
+    captcha_timeout_minutes: int = 3
+    captcha_max_attempts: int = 2
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -79,4 +92,7 @@ class Settings:
             ),
             support_rate_limit_count=max(1, _int("SUPPORT_RATE_LIMIT_COUNT", 5)),
             support_rate_limit_seconds=max(1, _int("SUPPORT_RATE_LIMIT_SECONDS", 60)),
+            captcha_enabled=_bool("CAPTCHA_ENABLED", True),
+            captcha_timeout_minutes=max(1, _int("CAPTCHA_TIMEOUT_MINUTES", 3)),
+            captcha_max_attempts=max(1, _int("CAPTCHA_MAX_ATTEMPTS", 2)),
         )

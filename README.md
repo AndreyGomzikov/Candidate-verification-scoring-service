@@ -537,3 +537,7 @@ LIVE_TEST_CHAT_CONFIRMED=yes LIVE_TEST_CHAT_ID=-1001234567890 \
 сохраняется для последующей повторной отправки. В `/status` отдельно
 показываются технические события без созданной анкеты и технические
 `pending_admin`. Подробнее: [`RELIABILITY_DEPLOY_RU.md`](RELIABILITY_DEPLOY_RU.md).
+
+## Эмодзи-капча
+
+Перед анкетой заявитель проходит эмодзи-капчу. Подробности и настройки: [CAPTCHA_RU.md](CAPTCHA_RU.md).

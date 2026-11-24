@@ -6,6 +6,7 @@ import logging
 import json
 import re
 import math
+import secrets
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from io import BytesIO
@@ -18,9 +19,10 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from . import texts
+from .captcha import make_captcha
 from .config import Settings
 from .db import Database
-from .keyboards import moderation_keyboard
+from .keyboards import captcha_keyboard, moderation_keyboard
 from .models import Candidate, CandidateStatus
 from .status_report import build_status_report
 from .scoring import (
@@ -35,6 +37,7 @@ from .support import SupportHandlers
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_TEXT_LIMIT = 4096
+_CAPTCHA_CALLBACK = re.compile(r"captcha:(\d+):([0-9a-f]{8}):(\d)")
 _ADMIN_CARD_SAFE_LIMIT = 3900
 
 
@@ -237,7 +240,24 @@ class GatekeeperHandlers:
                     await audit("ignored_older", candidate_id=active.id)
                     return
             active = await self.db.set_user_chat_id(active.id, req.user_chat_id)
-            if active.status == CandidateStatus.INTERVIEW.value:
+            # An unfinished side effect is recovered, never replayed here.
+            if active.status == CandidateStatus.INTERVIEW.value and (
+                active.captcha_pending_action is not None or
+                (active.stage == 0 and (active.captcha_attempts or 0) >= self.settings.captcha_max_attempts)
+            ):
+                await audit("captcha_state_changed", candidate_id=active.id)
+                return
+            if active.status == CandidateStatus.INTERVIEW.value and active.stage == 0:
+                try:
+                    sent = await self._send_captcha(context.bot, active)
+                    if sent is None:
+                        await audit("captcha_state_changed", candidate_id=active.id)
+                        return
+                    delivered = True
+                except TelegramError:
+                    logger.exception("Failed to resend captcha candidate=%s", active.id)
+                    delivered = False
+            elif active.status == CandidateStatus.INTERVIEW.value:
                 delivered = await self._send_candidate_message(
                     context.bot, active, self._question_for_stage(active.stage)
                 )
@@ -375,34 +395,54 @@ class GatekeeperHandlers:
             username=req.from_user.username,
             first_name=req.from_user.first_name,
             request_date=getattr(req, "date", None),
+            # Stage 0 = emoji captcha pending; omitted when captcha is off.
+            **({"stage": 0, "captcha_timeout_minutes": self.settings.captcha_timeout_minutes}
+               if self.settings.captcha_enabled else {}),
         )
         await audit("candidate_created", candidate_id=candidate.id)
         logger.info("join_candidate_created update_id=%s candidate=%s", audit_update_id, candidate.id)
 
+        captcha_enabled = self.settings.captcha_enabled
         try:
-            sent = await context.bot.send_message(
-                chat_id=req.user_chat_id,
-                text=f"{texts.INTRO}\n\n{texts.QUESTION_LOCATION}",
-            )
+            if captcha_enabled:
+                # The first DM is the captcha; the questionnaire starts only
+                # after it is solved (see on_captcha).
+                sent = await self._send_captcha(context.bot, candidate)
+                if sent is None:
+                    logger.info("Candidate left captcha stage before delivery id=%s", candidate.id)
+                    await audit("captcha_state_changed", candidate_id=candidate.id)
+                    return
+            else:
+                sent = await context.bot.send_message(
+                    chat_id=req.user_chat_id,
+                    text=f"{texts.INTRO}\n\n{texts.QUESTION_LOCATION}",
+                )
         except TelegramError as exc:
             # A Telegram timeout is not evidence of non-delivery. Never
-            # automatically resend a potentially delivered first question.
-            logger.exception("Failed to start interview for candidate=%s", candidate.id)
+            # automatically resend a potentially delivered first DM.
+            failure_status = "captcha_delivery_failed" if captcha_enabled else "first_question_failed"
+            failure_reason = (
+                f"Не удалось подтвердить доставку CAPTCHA: {type(exc).__name__}"
+                if captcha_enabled else f"Не удалось начать ЛС: {type(exc).__name__}"
+            )
+            logger.exception("Failed to start %s for candidate=%s",
+                             "captcha" if captcha_enabled else "interview", candidate.id)
             await audit(
-                "first_question_failed", candidate_id=candidate.id,
+                failure_status, candidate_id=candidate.id,
                 error_type=type(exc).__name__, alert_required=True,
             )
             candidate = await self.db.set_status(
                 candidate.id,
                 CandidateStatus.PENDING_ADMIN,
-                reason=f"Не удалось начать ЛС: {type(exc).__name__}",
+                reason=failure_reason,
             )
             try:
                 await self._send_admin_card(
                     context.bot, candidate, score=None,
                     scoring_error=(
-                        "Не удалось начать личный диалог с кандидатом. "
-                        "Автоматический отказ НЕ выполнен; требуется решение администратора."
+                        ("Не удалось подтвердить доставку CAPTCHA. " if captcha_enabled
+                         else "Не удалось начать личный диалог с кандидатом. ")
+                        + "Автоматический отказ НЕ выполнен; требуется решение администратора."
                     ),
                 )
             except Exception:
@@ -411,6 +451,17 @@ class GatekeeperHandlers:
                 if audit_update_id is not None:
                     await self.db.mark_join_request_alerted(audit_update_id)
             return
+
+        if captcha_enabled:
+            # This update records delivery of the challenge only. The first
+            # questionnaire message is sent and audited after a valid answer.
+            await audit("captcha_sent", candidate_id=candidate.id)
+            logger.info(
+                "join_captcha_sent update_id=%s candidate=%s",
+                audit_update_id, candidate.id,
+            )
+            return
+
         # Only a successful send_message return confirms Telegram accepted the
         # question. This is NOT proof that the user read it.
         message_id = getattr(sent, "message_id", None)
@@ -461,6 +512,15 @@ class GatekeeperHandlers:
             candidate = await self.db.set_user_chat_id(
                 candidate.id, update.effective_chat.id
             )
+
+        if candidate.stage == 0:
+            # Captcha still pending: no free-text answer is accepted or scored.
+            await update.effective_message.reply_text(texts.CAPTCHA_REMINDER)
+            return None
+
+        if candidate.captcha_pending_action is not None:
+            await update.effective_message.reply_text(texts.PENDING_ADMIN)
+            return None
 
         answer = update.effective_message.text.strip()
         if len(answer) > self.settings.max_answer_length:
@@ -1046,7 +1106,7 @@ class GatekeeperHandlers:
         """Reconcile interrupted join events and retry durable admin alerts.
 
         At-least-once alerts: a crash between Telegram success and DB ack may
-        duplicate a moderation card, never an approve/decline or first question.
+        duplicate a moderation card, never an approve/decline or first DM.
         """
         if not isinstance(self.db, Database):
             return 0
@@ -1060,12 +1120,34 @@ class GatekeeperHandlers:
                 candidate = (await self.db.get_candidate(event.candidate_id)
                              if event.candidate_id is not None else None)
                 if candidate is not None:
+                    if (event.status in {"first_question_failed", "captcha_delivery_failed"}
+                            and candidate.status == CandidateStatus.INTERVIEW.value):
+                        reason = (
+                            "Не подтверждена доставка CAPTCHA; требуется ручная проверка"
+                            if event.status == "captcha_delivery_failed" else
+                            "Не подтверждена отправка первого вопроса; требуется ручная проверка"
+                        )
+                        candidate = await self.db.transition_status_if(
+                            candidate.id, CandidateStatus.PENDING_ADMIN,
+                            expected_status=CandidateStatus.INTERVIEW,
+                            expected_stage=candidate.stage,
+                            reason=reason,
+                        ) or await self.db.get_candidate(event.candidate_id)
+                    if event.status == "captcha_delivery_failed":
+                        delivery_note = "Доставка CAPTCHA не подтверждена."
+                    elif event.status == "first_question_failed":
+                        delivery_note = "Отправка первого вопроса не подтверждена."
+                    elif event.status == "delivery_unconfirmed" and candidate.stage == 0:
+                        delivery_note = "Доставка CAPTCHA не подтверждена после перезапуска."
+                    elif event.status == "delivery_unconfirmed":
+                        delivery_note = "Доставка первого вопроса не подтверждена."
+                    else:
+                        delivery_note = "Обработка заявки прервалась до подтверждения этапа доставки."
                     await self._send_admin_card(
                         bot, candidate, score=None,
                         scoring_error=(
                             "⚠️ Технический сбой обработки заявки: "
-                            f"{event.error_type or event.status}. "
-                            "Доставка первого вопроса не подтверждена; "
+                            f"{event.error_type or event.status}. {delivery_note} "
                             "не отклонять автоматически."
                         ),
                         with_buttons=(candidate.status == CandidateStatus.PENDING_ADMIN.value),
@@ -1098,19 +1180,46 @@ class GatekeeperHandlers:
         cutoff = datetime.now(timezone.utc) - timedelta(
             minutes=self.settings.interview_timeout_minutes
         )
-        candidates = await self.db.list_expired_interviews(cutoff)
+        captcha_cutoff = None
+        if self.settings.captcha_enabled or isinstance(self.db, Database):
+            captcha_cutoff = datetime.now(timezone.utc) - timedelta(
+                minutes=self.settings.captcha_timeout_minutes
+            )
+            candidates = await self.db.list_expired_interviews(
+                cutoff, captcha_cutoff=captcha_cutoff
+            )
+        else:
+            candidates = await self.db.list_expired_interviews(cutoff)
         processed = 0
         for item in candidates:
             async with self._request_lock(item.target_chat_id, item.user_id):
                 candidate = await self.db.get_candidate(item.id)
                 if candidate is None or candidate.status != CandidateStatus.INTERVIEW.value:
                     continue
+                if candidate.stage == 0:
+                    active = await self.db.get_active_candidate_for_chat(candidate.user_id, candidate.target_chat_id)
+                    if active is None or active.id != candidate.id:
+                        continue
+                    claimed = await self.db.claim_captcha_timeout(
+                        candidate.id, timeout_minutes=self.settings.captcha_timeout_minutes,
+                        max_attempts=self.settings.captcha_max_attempts,
+                    )
+                    if claimed is not None and await self._complete_captcha_decline(bot, claimed, "decline_timeout"):
+                        processed += 1
+                    continue
+                if candidate.captcha_pending_action is not None:
+                    continue
                 updated_at = candidate.updated_at
                 if updated_at is None:
                     continue
                 if updated_at.tzinfo is None:
                     updated_at = updated_at.replace(tzinfo=timezone.utc)
-                if candidate.stage > 3 or updated_at >= cutoff:
+                # Captcha (stage 0) has its own, shorter deadline.
+                item_cutoff = (
+                    captcha_cutoff if candidate.stage == 0 and captcha_cutoff is not None
+                    else cutoff
+                )
+                if candidate.stage > 3 or updated_at >= item_cutoff:
                     continue
                 active = await self.db.get_active_candidate_for_chat(
                     candidate.user_id, candidate.target_chat_id
@@ -1128,7 +1237,7 @@ class GatekeeperHandlers:
                         updated = await self.db.transition_status_if(
                             candidate.id, CandidateStatus.EXPIRED,
                             expected_status=CandidateStatus.INTERVIEW,
-                            expected_stage=candidate.stage, older_than=cutoff,
+                            expected_stage=candidate.stage, older_than=item_cutoff,
                             reason=(
                                 "Анкета просрочена; Telegram-заявка отсутствует или "
                                 "уже обработана (Hide_requester_missing). "
@@ -1142,7 +1251,7 @@ class GatekeeperHandlers:
                     updated = await self.db.transition_status_if(
                         candidate.id, CandidateStatus.PENDING_ADMIN,
                         expected_status=CandidateStatus.INTERVIEW,
-                        expected_stage=candidate.stage, older_than=cutoff,
+                        expected_stage=candidate.stage, older_than=item_cutoff,
                         reason=(
                             "Interview timeout, Telegram decline failed: "
                             f"{type(exc).__name__}"
@@ -1161,13 +1270,225 @@ class GatekeeperHandlers:
                 updated = await self.db.transition_status_if(
                     candidate.id, CandidateStatus.EXPIRED,
                     expected_status=CandidateStatus.INTERVIEW,
-                    expected_stage=candidate.stage, older_than=cutoff,
-                    reason="Анкета не завершена до истечения таймаута",
+                    expected_stage=candidate.stage, older_than=item_cutoff,
+                    reason=(
+                        "Капча не пройдена до истечения таймаута"
+                        if candidate.stage == 0
+                        else "Анкета не завершена до истечения таймаута"
+                    ),
                 )
                 if updated is not None:
-                    await self._send_candidate_message(bot, updated, texts.TIMEOUT)
+                    await self._send_candidate_message(
+                        bot, updated,
+                        texts.CAPTCHA_TIMEOUT if candidate.stage == 0 else texts.TIMEOUT,
+                    )
                     processed += 1
         return processed
+
+    # ---- emoji captcha -------------------------------------------------
+
+    async def _issue_captcha(self, candidate: Candidate):
+        """Persist a fresh captcha; returns (text, keyboard) or None if the
+        candidate is no longer waiting at stage 0."""
+        captcha = make_captcha()
+        token = secrets.token_hex(4)
+        updated = await self.db.set_captcha(
+            candidate.id, captcha.correct_index, token,
+            max_attempts=self.settings.captcha_max_attempts,
+            timeout_minutes=self.settings.captcha_timeout_minutes,
+        )
+        if updated is None:
+            return None
+        return (
+            texts.captcha_message(captcha.prompt),
+            captcha_keyboard(candidate.id, token, captcha.options),
+        )
+
+    async def _send_captcha(self, bot: Bot, candidate: Candidate):
+        """Send a new captcha DM. Raises TelegramError on delivery failure;
+        returns None if the candidate has left stage 0."""
+        issued = await self._issue_captcha(candidate)
+        if issued is None:
+            return None
+        text, markup = issued
+        return await bot.send_message(
+            chat_id=candidate.user_chat_id, text=text, reply_markup=markup
+        )
+
+    @staticmethod
+    async def _safe_answer(query, text: str | None = None) -> None:
+        try:
+            await query.answer(text)
+        except TelegramError:
+            logger.warning("Could not answer captcha callback", exc_info=True)
+
+    @staticmethod
+    async def _safe_edit(query, text: str, reply_markup=None) -> bool:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup)
+            return True
+        except TelegramError:
+            logger.warning("Could not edit captcha message", exc_info=True)
+            return False
+
+    async def on_captcha(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        query = update.callback_query
+        if query is None or query.from_user is None:
+            return
+        match = _CAPTCHA_CALLBACK.fullmatch(query.data or "")
+        if match is None:
+            await self._safe_answer(query)
+            return
+        candidate_id, token, index = int(match[1]), match[2], int(match[3])
+        candidate = await self.db.get_candidate(candidate_id)
+        # Only the applicant may press. Anyone else is ignored without feedback.
+        if candidate is None or candidate.user_id != query.from_user.id:
+            await self._safe_answer(query)
+            return
+        async with self._request_lock(candidate.target_chat_id, candidate.user_id):
+            outcome, current = await self.db.answer_captcha(
+                candidate.id, token=token, chosen_index=index,
+                max_attempts=self.settings.captcha_max_attempts,
+                timeout_minutes=self.settings.captcha_timeout_minutes,
+            )
+            if outcome == "passed":
+                await self._captcha_passed(context.bot, query, current)
+            elif outcome == "retry":
+                await self._captcha_retry(context.bot, query, current)
+            elif outcome in ("failed", "expired"):
+                await self._captcha_failed(context.bot, query, current, expired=(outcome == "expired"))
+            else:  # stale keyboard, replayed press or candidate already moved on
+                await self._safe_answer(query)
+
+    async def _captcha_passed(self, bot: Bot, query, candidate: Candidate) -> None:
+        await self._safe_answer(query)
+        await self._safe_edit(query, texts.CAPTCHA_PASSED)
+        try:
+            sent = await bot.send_message(
+                candidate.user_chat_id, f"{texts.INTRO}\n\n{texts.QUESTION_LOCATION}"
+            )
+        except TelegramError as exc:
+            logger.exception("Failed to send first question after captcha candidate=%s", candidate.id)
+            await self._captcha_manual_review(bot, candidate, "first_question",
+                f"Капча пройдена, но доставка первого вопроса не подтверждена: {type(exc).__name__}")
+        else:
+            confirmed = await self.db.confirm_captcha_delivery(
+                candidate.id, "first_question",
+                first_message_id=getattr(sent, "message_id", None),
+            )
+            if not confirmed:
+                logger.error(
+                    "First question was sent but CAPTCHA delivery state was not acknowledged candidate=%s",
+                    candidate.id,
+                )
+
+    async def _captcha_retry(self, bot: Bot, query, candidate: Candidate) -> None:
+        await self._safe_answer(query, texts.CAPTCHA_WRONG)
+        issued = await self._issue_captcha(candidate)
+        if issued is None:
+            # The fixed deadline may elapse during the Telegram callback call.
+            claimed = await self.db.claim_captcha_timeout(
+                candidate.id, timeout_minutes=self.settings.captcha_timeout_minutes,
+                max_attempts=self.settings.captcha_max_attempts, action="retry_delivery",
+            )
+            if claimed is not None:
+                closed = await self._complete_captcha_decline(bot, claimed, "decline_timeout", notify=False)
+                await self._safe_edit(query, texts.CAPTCHA_TIMEOUT if closed else texts.PENDING_ADMIN)
+            return
+        text, markup = issued
+        if not await self._safe_edit(query, text, reply_markup=markup):
+            try:
+                await bot.send_message(candidate.user_chat_id, text, reply_markup=markup)
+            except TelegramError as exc:
+                logger.exception("Could not deliver retry captcha candidate=%s", candidate.id)
+                await self._captcha_manual_review(bot, candidate, "retry_delivery",
+                    f"Не подтверждена доставка повторной капчи: {type(exc).__name__}")
+                return
+        await self.db.confirm_captcha_delivery(candidate.id, "retry_delivery")
+
+    async def _captcha_failed(self, bot: Bot, query, candidate: Candidate, *, expired=False) -> None:
+        await self._safe_answer(query)
+        closed = await self._complete_captcha_decline(
+            bot, candidate, "decline_timeout" if expired else "decline_failed", notify=False,
+        )
+        await self._safe_edit(query, (texts.CAPTCHA_TIMEOUT if expired else texts.CAPTCHA_FAILED)
+                              if closed else texts.PENDING_ADMIN)
+
+    async def _complete_captcha_decline(self, bot: Bot, candidate: Candidate, action: str,
+                                         *, notify=True) -> bool:
+        """Call Telegram only for a freshly claimed intent under the applicant lock."""
+        reason = ("Капча не пройдена до истечения таймаута" if action == "decline_timeout"
+                  else "Капча не пройдена: исчерпаны попытки")
+        try:
+            accepted = await bot.decline_chat_join_request(
+                chat_id=candidate.target_chat_id, user_id=candidate.user_id
+            )
+            if accepted is False:
+                raise TelegramError("Telegram did not confirm decline")
+        except TelegramError as exc:
+            if _join_request_missing(exc):
+                updated = await self.db.finish_captcha_action(candidate.id, action, expired=True,
+                    reason=f"{reason}; Telegram-заявка отсутствует или уже обработана (Hide_requester_missing). Отклонение не выполнялось.")
+                return updated is not None
+            logger.exception("Failed to decline after captcha candidate=%s", candidate.id)
+            await self._captcha_manual_review(bot, candidate, action,
+                f"{reason}; Telegram не подтвердил отклонение: {type(exc).__name__}")
+            return False
+        updated = await self.db.finish_captcha_action(candidate.id, action, expired=True, reason=reason)
+        if updated is not None and notify:
+            await self._send_candidate_message(bot, updated, texts.CAPTCHA_TIMEOUT)
+        return updated is not None
+
+    async def _captcha_manual_review(self, bot: Bot, candidate: Candidate, action: str | None,
+                                     reason: str, *, exhausted_limit=None) -> None:
+        updated = await self.db.finish_captcha_action(candidate.id, action, reason=reason,
+                                                       exhausted_limit=exhausted_limit)
+        if updated is not None:
+            await self._deliver_captcha_notice(bot, updated)
+
+    async def _deliver_captcha_notice(self, bot: Bot, candidate: Candidate) -> None:
+        try:
+            await self._send_admin_card(bot, candidate, score=None, scoring_error=(
+                f"{candidate.decision_reason}. Автоматическое решение не подтверждено; "
+                "требуется ручная проверка."
+            ))
+        except Exception:
+            logger.exception("Captcha admin card queued for retry candidate=%s", candidate.id)
+            return
+        await self.db.mark_captcha_notice_sent(candidate.id)
+
+    async def recover_captcha_actions(self, bot: Bot) -> int:
+        """Recover abandoned intents without repeating a potentially executed decline.
+
+        Recheck under the same PostgreSQL/user lock as the callback. A running
+        operation either finishes before we acquire it or leaves a durable intent.
+        """
+        recovered = 0
+        for item in await self.db.list_captcha_recovery(self.settings.captcha_max_attempts):
+            async with self._request_lock(item.target_chat_id, item.user_id):
+                current = await self.db.get_candidate(item.id)
+                if current is None or current.status != CandidateStatus.INTERVIEW.value:
+                    continue
+                action = current.captcha_pending_action
+                exhausted = current.stage == 0 and current.captcha_attempts >= self.settings.captcha_max_attempts
+                if action is None and not exhausted:
+                    continue
+                reason = ("Прервана обработка капчи: результат Telegram не подтверждён; повтор операции запрещён"
+                          if action else "Исчерпаны попытки капчи; результат прежнего отклонения неизвестен")
+                updated = await self.db.finish_captcha_action(current.id, action, reason=reason,
+                    exhausted_limit=self.settings.captcha_max_attempts if action is None else None)
+                recovered += int(updated is not None)
+        # Durable outbox: retry after a crash or delivery failure. A crash after
+        # send and before acknowledgement can duplicate a card, not a decision.
+        for item in await self.db.list_captcha_notices():
+            async with self._request_lock(item.target_chat_id, item.user_id):
+                current = await self.db.get_candidate(item.id)
+                if (current is not None and current.status == CandidateStatus.PENDING_ADMIN.value
+                        and current.captcha_notice_pending):
+                    await self._deliver_captcha_notice(bot, current)
+        return recovered
 
     async def _send_candidate_message(
         self, bot: Bot, candidate: Candidate, text: str
@@ -1401,7 +1722,8 @@ class GatekeeperHandlers:
                 f"Confidence Score: {score.confidence_score if score else 'нет'}"
                 f"{' (без неподтверждённого спам-штрафа)' if score and score.spam_penalty_withheld else ''}\n"
                 f"{'Исходный Score со штрафом: ' + str(score.preliminary_confidence_score) + chr(10) if score and score.spam_penalty_withheld else ''}"
-                "Подробная карточка не отправилась из-за ошибки форматирования."
+                "\nПодробная карточка не отправилась."
+                + (f"\nПричина: {scoring_error}" if scoring_error else "")
             )
             await bot.send_message(
                 chat_id=self.settings.admin_chat_id,

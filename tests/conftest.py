@@ -33,6 +33,11 @@ except ModuleNotFoundError:
             self.callback_data = callback_data
             self.url = url
 
+    class InputFile:
+        def __init__(self, obj, filename=None):
+            self.filename = filename
+            self.input_file_content = obj.read() if hasattr(obj, "read") else obj
+
     class ForceReply:
         def __init__(self, selective: bool = False,
                      input_field_placeholder: str | None = None):
@@ -56,6 +61,7 @@ except ModuleNotFoundError:
     class ContextTypes:
         DEFAULT_TYPE = object
 
+    telegram.InputFile = InputFile
     telegram.Bot = Bot
     telegram.Update = Update
     telegram.InlineKeyboardButton = InlineKeyboardButton
