@@ -1372,7 +1372,8 @@ class GatekeeperHandlers:
         except TelegramError as exc:
             logger.exception("Failed to send first question after captcha candidate=%s", candidate.id)
             await self._captcha_manual_review(bot, candidate, "first_question",
-                f"Капча пройдена, но доставка первого вопроса не подтверждена: {type(exc).__name__}")
+                f"Капча пройдена, но доставка первого вопроса не подтверждена: {type(exc).__name__}",
+                error_type=type(exc).__name__)
         else:
             confirmed = await self.db.confirm_captcha_delivery(
                 candidate.id, "first_question",
@@ -1404,7 +1405,8 @@ class GatekeeperHandlers:
             except TelegramError as exc:
                 logger.exception("Could not deliver retry captcha candidate=%s", candidate.id)
                 await self._captcha_manual_review(bot, candidate, "retry_delivery",
-                    f"Не подтверждена доставка повторной капчи: {type(exc).__name__}")
+                    f"Не подтверждена доставка повторной капчи: {type(exc).__name__}",
+                    error_type=type(exc).__name__)
                 return
         await self.db.confirm_captcha_delivery(candidate.id, "retry_delivery")
 
@@ -1430,11 +1432,13 @@ class GatekeeperHandlers:
         except TelegramError as exc:
             if _join_request_missing(exc):
                 updated = await self.db.finish_captcha_action(candidate.id, action, expired=True,
-                    reason=f"{reason}; Telegram-заявка отсутствует или уже обработана (Hide_requester_missing). Отклонение не выполнялось.")
+                    reason=f"{reason}; Telegram-заявка отсутствует или уже обработана (Hide_requester_missing). Отклонение не выполнялось.",
+                    error_type=type(exc).__name__)
                 return updated is not None
             logger.exception("Failed to decline after captcha candidate=%s", candidate.id)
             await self._captcha_manual_review(bot, candidate, action,
-                f"{reason}; Telegram не подтвердил отклонение: {type(exc).__name__}")
+                f"{reason}; Telegram не подтвердил отклонение: {type(exc).__name__}",
+                error_type=type(exc).__name__)
             return False
         updated = await self.db.finish_captcha_action(candidate.id, action, expired=True, reason=reason)
         if updated is not None and notify:
@@ -1442,9 +1446,11 @@ class GatekeeperHandlers:
         return updated is not None
 
     async def _captcha_manual_review(self, bot: Bot, candidate: Candidate, action: str | None,
-                                     reason: str, *, exhausted_limit=None) -> None:
+                                     reason: str, *, exhausted_limit=None,
+                                     error_type: str | None = None) -> None:
         updated = await self.db.finish_captcha_action(candidate.id, action, reason=reason,
-                                                       exhausted_limit=exhausted_limit)
+                                                       exhausted_limit=exhausted_limit,
+                                                       error_type=error_type)
         if updated is not None:
             await self._deliver_captcha_notice(bot, updated)
 

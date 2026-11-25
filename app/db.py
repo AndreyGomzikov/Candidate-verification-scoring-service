@@ -807,7 +807,8 @@ class Database:
 
     async def finish_captcha_action(self, candidate_id: int, action: str | None, *,
                                     reason: str, expired: bool = False,
-                                    exhausted_limit: int | None = None) -> Candidate | None:
+                                    exhausted_limit: int | None = None,
+                                    error_type: str | None = None) -> Candidate | None:
         """Atomically close the intent and enqueue a card on uncertain outcomes."""
         condition = (Candidate.captcha_pending_action.is_(None) if action is None
                      else Candidate.captcha_pending_action == action)
@@ -835,12 +836,15 @@ class Database:
                     event_status = "captcha_delivery_failed"
                 else:
                     event_status = "captcha_decline_unconfirmed"
+                event_values = {"status": event_status, "updated_at": now}
+                if error_type is not None:
+                    event_values["error_type"] = error_type[:100]
                 await session.execute(update(JoinRequestEvent).where(
                     JoinRequestEvent.candidate_id == candidate_id,
                     JoinRequestEvent.status.in_(
                         ("captcha_sent", "captcha_passed", "candidate_created", "processing_error")
                     ),
-                ).values(status=event_status, updated_at=now))
+                ).values(**event_values))
             await session.commit()
             return await session.get(Candidate, key) if key is not None else None
 

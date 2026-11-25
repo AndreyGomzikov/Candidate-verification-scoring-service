@@ -20,6 +20,10 @@ from tests.test_handlers import NoopScorer, settings
 pytest.importorskip("aiosqlite")
 
 
+class Forbidden(TelegramError):
+    """PTB-compatible exception used to assert the persisted class name."""
+
+
 def make_update(update_id: int, *, user_id: int = 900, date=None):
     return NS(
         update_id=update_id,
@@ -98,6 +102,46 @@ def test_captcha_send_is_not_recorded_as_first_question_and_pass_records_real_me
         assert candidate.stage == 1
         assert candidate.captcha_pending_action is None
         assert bot.send_message.await_count == 2
+    with_db(tmp_path, scenario)
+
+
+def test_captcha_passed_but_forbidden_first_question_persists_error_type(tmp_path):
+    async def scenario(db):
+        bot = NS(
+            send_message=AsyncMock(side_effect=[
+                NS(message_id=123),
+                Forbidden("bot can't initiate conversation with a user"),
+                NS(message_id=82),  # administrator notification
+            ]),
+            decline_chat_join_request=AsyncMock(),
+        )
+        handler = GatekeeperHandlers(
+            settings=replace(settings(), captcha_enabled=True), db=db, scorer=NoopScorer(),
+        )
+        await handler.on_join_request(make_update(5104), NS(bot=bot))
+        event = await get_event(db, 5104)
+        candidate = await db.get_candidate(event.candidate_id)
+        assert event.status == "captcha_sent"
+        assert event.error_type is None
+
+        query = NS(
+            data=f"captcha:{candidate.id}:{candidate.captcha_token}:{candidate.captcha_correct_index}",
+            from_user=NS(id=candidate.user_id),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        await handler.on_captcha(NS(callback_query=query), NS(bot=bot))
+
+        event = await get_event(db, 5104)
+        candidate = await db.get_candidate(candidate.id)
+        assert candidate.status == CandidateStatus.PENDING_ADMIN.value
+        assert candidate.stage == 1
+        assert "Forbidden" in candidate.decision_reason
+        assert event.status == "first_question_failed"
+        assert event.error_type == "Forbidden"
+        assert event.first_message_id is None
+        assert bot.send_message.await_count == 3
+        bot.decline_chat_join_request.assert_not_awaited()
     with_db(tmp_path, scenario)
 
 

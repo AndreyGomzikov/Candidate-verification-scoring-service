@@ -172,6 +172,7 @@ def test_retry_delivery_failure_queues_manual_review_and_notice():
         h._send_admin_card = AsyncMock(side_effect=TelegramError("admin offline"))
         await h.on_captcha(SimpleNamespace(callback_query=query), _ctx(bot))
         assert db.finish_captcha_action.await_args.args == (cand.id, "retry_delivery")
+        assert db.finish_captcha_action.await_args.kwargs["error_type"] == "TelegramError"
         db.confirm_captcha_delivery.assert_not_awaited()
         db.mark_captcha_notice_sent.assert_not_awaited()
         bot.decline_chat_join_request.assert_not_awaited()
@@ -194,8 +195,37 @@ def test_first_question_delivery_failure_uses_durable_notice():
         h._send_admin_card = AsyncMock()
         await h.on_captcha(SimpleNamespace(callback_query=_query()), _ctx(bot))
         assert db.finish_captcha_action.await_args.args == (cand.id, "first_question")
+        assert db.finish_captcha_action.await_args.kwargs["error_type"] == "TelegramError"
         db.mark_captcha_notice_sent.assert_awaited_once_with(cand.id)
         db.confirm_captcha_delivery.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def test_decline_failure_passes_telegram_error_type_to_manual_review():
+    from telegram.error import TelegramError
+
+    async def scenario():
+        failed = _candidate(captcha_attempts=2, captcha_pending_action="decline_failed")
+        reviewed = _candidate(
+            status=CandidateStatus.PENDING_ADMIN.value,
+            decision_reason="decline uncertain", captcha_notice_pending=True,
+        )
+        db = SimpleNamespace(
+            get_candidate=AsyncMock(return_value=_candidate()),
+            answer_captcha=AsyncMock(return_value=("failed", failed)),
+            finish_captcha_action=AsyncMock(return_value=reviewed),
+            mark_captcha_notice_sent=AsyncMock(),
+        )
+        bot = SimpleNamespace(
+            send_message=AsyncMock(),
+            decline_chat_join_request=AsyncMock(side_effect=TelegramError("decline unavailable")),
+        )
+        handler = _handlers(db)
+        handler._send_admin_card = AsyncMock()
+        await handler.on_captcha(SimpleNamespace(callback_query=_query()), _ctx(bot))
+        assert db.finish_captcha_action.await_args.args == (failed.id, "decline_failed")
+        assert db.finish_captcha_action.await_args.kwargs["error_type"] == "TelegramError"
+        db.mark_captcha_notice_sent.assert_awaited_once_with(failed.id)
     asyncio.run(scenario())
 
 

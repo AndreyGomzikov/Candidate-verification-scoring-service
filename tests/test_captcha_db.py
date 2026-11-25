@@ -125,6 +125,23 @@ def test_captcha_terminal_actions_update_join_event(tmp_path):
             timed_out.id, "decline_timeout", expired=True, reason="timeout",
         )
 
+        delivery_failed = await _new(db, user_id=13)
+        await db.record_join_request_event(
+            update_id=91004, target_chat_id=-100, user_id=delivery_failed.user_id,
+            request_date=None,
+        )
+        await db.update_join_request_event(91004, "captcha_sent", candidate_id=delivery_failed.id)
+        await db.set_captcha(delivery_failed.id, 1, "delivery-token")
+        outcome, _ = await db.answer_captcha(
+            delivery_failed.id, token="delivery-token", chosen_index=1, max_attempts=2,
+        )
+        assert outcome == "passed"
+        closed = await db.finish_captcha_action(
+            delivery_failed.id, "first_question", reason="Forbidden",
+            error_type="Forbidden",
+        )
+        assert closed.status == "pending_admin"
+
         async with db.sessions() as session:
             failed_event = await session.scalar(select(JoinRequestEvent).where(
                 JoinRequestEvent.update_id == 91002,
@@ -132,8 +149,13 @@ def test_captcha_terminal_actions_update_join_event(tmp_path):
             timeout_event = await session.scalar(select(JoinRequestEvent).where(
                 JoinRequestEvent.update_id == 91003,
             ))
+            delivery_event = await session.scalar(select(JoinRequestEvent).where(
+                JoinRequestEvent.update_id == 91004,
+            ))
             assert failed_event.status == "captcha_failed"
             assert timeout_event.status == "captcha_timeout"
+            assert delivery_event.status == "first_question_failed"
+            assert delivery_event.error_type == "Forbidden"
     _run_db(tmp_path, scenario)
 
 
